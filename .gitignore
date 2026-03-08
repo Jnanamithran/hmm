@@ -74,4 +74,4 @@ firebase-debug.log
 *.tmp
 *.swp
 
-*.csv
+laptop/frontend/login.json
