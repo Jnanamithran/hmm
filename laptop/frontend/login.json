@@ -1,0 +1,51 @@
+{
+  "users": {
+    "AXOzcokw6rTqnmIIc4lELtzzCH12": {
+      "role": "manager",
+      "email": "jnanamithranm@gmail.com",
+      "name": "Jnanamithran M"
+    },
+
+    "B1Zhe8OW2KPDX39N8WeVUGTbLb63": {
+      "role": "manager",
+      "email": "sharon2005maria@gmail.com",
+      "name": "Sharon"
+    },
+
+     "1sWZ6LrDuTS7FdC6sIxCz59dT5C2": {
+      "role": "manager",
+      "email": "tc13.21894@gmail.com",
+      "name": "Raishna"
+    },
+    
+     "EGREmzOs7uXCgAmZE0vENA3TUVC2": {
+      "role": "manager",
+      "email": "vaisakhj2@gmail.com",
+      "name": "Vaisakh"
+    },
+
+    "27KWQbqKhTMJKtuHmrdyqB41fbu2": {
+      "role": "controller",
+      "email": "jnanamithran@viper.com",
+      "name": "Operator jnanami"
+    },
+
+    "r8OZ8JbNDkOIKPzJTvSTXAldMs83": {
+      "role": "controller",
+      "email": "sharon@viper.com",
+      "name": "Operator sharon"
+    },
+
+    "a1ugsCXebbbcvnO5UBsTOBA8Vtj2": {
+      "role": "controller",
+      "email": "raishna@viper.com",
+      "name": "Operator raishna"
+    },
+
+    "lc7ubHno6PVtQJS8ACcJNrLs4kt2": {
+      "role": "controller",
+      "email": "vaisakh@viper.com",
+      "name": "Operator vaisakh"
+    }
+  }
+}
