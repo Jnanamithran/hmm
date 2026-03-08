@@ -73,3 +73,5 @@ firebase-debug.log
 # =========================
 *.tmp
 *.swp
+
+*.csv
