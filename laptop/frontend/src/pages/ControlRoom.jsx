@@ -48,6 +48,11 @@ export default function ControlRoom() {
     recording:false, filename:null, duration_s:null, frames:0
   });
 
+  // ── Pi system vitals (forwarded through laptop /health) ────────────────────
+  const [piTemp,      setPiTemp]      = useState(null);
+  const [pingMs,      setPingMs]      = useState(null);
+  const [thermalAvgC, setThermalAvgC] = useState(null);
+
   // ── Drive ──────────────────────────────────────────────────────────────────
   const [lastCmd,    setLastCmd]    = useState("stop");
   const [cmdError,   setCmdError]   = useState(null);
@@ -129,6 +134,13 @@ export default function ControlRoom() {
           setThermalEnabled(h.thermal_enabled ?? false);
           if (h.thermal_alpha != null) setThermalAlpha(Math.round(h.thermal_alpha * 100));
           if (h.recording) setRecStatus(h.recording);
+          // Pi system vitals
+          if (h.pi_temp    != null) setPiTemp(h.pi_temp);
+          if (h.ping_ms    != null) setPingMs(h.ping_ms);
+          if (h.thermal_avg_c != null) {
+            setThermalAvgC(h.thermal_avg_c);
+            loggerRef.current?.addThermalReading(h.thermal_avg_c);
+          }
         }
       } catch {}
     };
@@ -231,6 +243,9 @@ export default function ControlRoom() {
             </button>
             <button className={`tab-btn ${tab==="analytics"?"tab-active":""}`} onClick={()=>setTab("analytics")}>
               ◈ ANALYTICS
+            </button>
+            <button className="tab-btn" onClick={() => navigate("/system-health")}>
+              ⬡ HEALTH
             </button>
           </div>
 

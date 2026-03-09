@@ -5,3 +5,7 @@ ultralytics>=8.0.0
 opencv-python>=4.8.0
 numpy>=1.24.0
 requests>=2.31.0
+
+# Firebase Admin SDK — Firestore backend push (mission_logs collection)
+# Requires a service account JSON key. See ai_server.py for setup instructions.
+firebase-admin>=6.5.0

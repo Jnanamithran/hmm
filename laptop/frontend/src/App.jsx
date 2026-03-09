@@ -5,6 +5,7 @@ import Login           from "./pages/Login.jsx";
 import ControlRoom     from "./pages/ControlRoom.jsx";
 import Dashboard       from "./pages/Dashboard.jsx";
 import DetectionLog    from "./pages/DetectionLog.jsx";
+import SystemHealth    from "./pages/SystemHealth.jsx";
 
 function Splash({ msg = "AUTHENTICATING..." }) {
   return (
@@ -55,6 +56,9 @@ export default function App() {
       {/* CONTROLLER ONLY */}
       <Route path="/control" element={
         <Guard allowRole="controller"><ControlRoom/></Guard>
+      }/>
+      <Route path="/system-health" element={
+        <Guard allowRole="controller"><SystemHealth/></Guard>
       }/>
 
       {/* MANAGER ONLY */}

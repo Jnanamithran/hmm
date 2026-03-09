@@ -3,8 +3,8 @@
 // Each row: date, time, label, confidence, gas PPM, gas level, operator, session ID.
 // Features: search/filter by label, date range, CSV download.
 
-import { useState, useEffect, useMemo } from "react";
-import { ref, onValue, query, orderByChild, limitToLast } from "firebase/database";
+import { useState, useEffect, useMemo, useCallback } from "react";
+import { ref, onValue, get, query, orderByChild, limitToLast } from "firebase/database";
 import { db } from "../firebase";
 import { useAuth } from "../contexts/AuthContext";
 import { useNavigate } from "react-router-dom";
@@ -21,21 +21,34 @@ const gasColor = (lvl) => ({
 
 const confColor = (c) => c >= 0.8 ? "#00ff88" : c >= 0.6 ? "#ffe033" : "#ff6b35";
 
+// ── CSV helpers ──────────────────────────────────────────────────────────────
+function escapeCsv(v) { return `"${String(v ?? "").replace(/"/g, '""')}"`; }
+function buildCsvString(header, rows) {
+  return [header, ...rows].map(r => r.map(escapeCsv).join(",")).join("\n");
+}
+function triggerDownload(csvStr, filename) {
+  const blob = new Blob([csvStr], { type: "text/csv;charset=utf-8;" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+
 export default function DetectionLog() {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
 
-  const [events,   setEvents]   = useState([]);
-  const [loading,  setLoading]  = useState(true);
-  const [search,   setSearch]   = useState("");
-  const [gasFilter,setGasFilter]= useState("all");   // all | safe | low | warning | danger
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo,   setDateTo]   = useState("");
-  const [page,     setPage]     = useState(1);
+  const [events,      setEvents]      = useState([]);
+  const [loading,     setLoading]     = useState(true);
+  const [search,      setSearch]      = useState("");
+  const [gasFilter,   setGasFilter]   = useState("all");
+  const [dateFrom,    setDateFrom]    = useState("");
+  const [dateTo,      setDateTo]      = useState("");
+  const [page,        setPage]        = useState(1);
+  const [histLoading, setHistLoading] = useState(false);
   const PAGE_SIZE = 50;
 
   useEffect(() => {
-    // Load up to 2000 most recent detection events
     const q = query(ref(db, "detectionEvents"), orderByChild("timestamp"), limitToLast(2000));
     const unsub = onValue(q, snap => {
       if (!snap.exists()) { setEvents([]); setLoading(false); return; }
@@ -48,7 +61,7 @@ export default function DetectionLog() {
     return unsub;
   }, []);
 
-  // ── Filtering ─────────────────────────────────────────────────────────────
+  // ── Filtering ────────────────────────────────────────────────────────────
   const filtered = useMemo(() => {
     let out = events;
     if (search.trim()) {
@@ -75,34 +88,131 @@ export default function DetectionLog() {
 
   const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
   const pageData   = filtered.slice((page-1)*PAGE_SIZE, page*PAGE_SIZE);
-
-  // Reset to page 1 when filter changes
   useEffect(() => setPage(1), [search, gasFilter, dateFrom, dateTo]);
 
-  // ── CSV download ──────────────────────────────────────────────────────────
-  const downloadCSV = () => {
-    const header = ["Date","Time","Label","Confidence %","Gas PPM","Gas Level","Operator","Session ID"];
-    const rows   = filtered.map(e => [
-      fmtDate(e.timestamp),
-      fmtTime(e.timestamp),
-      e.label || "",
-      e.confidence != null ? Math.round(e.confidence*100) : "",
-      e.gasPpm    != null  ? e.gasPpm.toFixed(1) : "",
-      e.gasLevel  || "",
+  // ── Live-view CSV (filtered events, columns per spec) ─────────────────────
+  const downloadFilteredCSV = useCallback(() => {
+    const header = [
+      "Timestamp","Session_ID","Defect_Type","Confidence",
+      "Avg_Temp","Gas_PPM","Gas_Level","Operator",
+    ];
+    const rows = filtered.map(e => [
+      fmtDateTime(e.timestamp),
+      e.sessionId   || "",
+      e.label       || "",
+      e.confidence  != null ? (e.confidence * 100).toFixed(1) + "%" : "",
+      e.thermalAvgC != null ? e.thermalAvgC.toFixed(1) : "",
+      e.gasPpm      != null ? e.gasPpm.toFixed(1)      : "",
+      e.gasLevel    || "",
       e.controllerName || "",
-      e.sessionId || "",
     ]);
-    const csv = [header, ...rows]
-      .map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(","))
-      .join("\n");
-    const blob = new Blob([csv], { type:"text/csv;charset=utf-8;" });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement("a");
-    a.href     = url;
-    a.download = `viper-detections-${new Date().toISOString().slice(0,10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+    triggerDownload(
+      buildCsvString(header, rows),
+      `viper-detections-${new Date().toISOString().slice(0,10)}.csv`,
+    );
+  }, [filtered]);
+
+  // ── Full Mission History CSV ──────────────────────────────────────────────
+  // Fetches ALL sessions + ALL detectionEvents from Firebase (no 2000-row cap).
+  // Joins detectionEvents → sessions by sessionId to enrich each row with
+  // session-level avgThermalC when the event-level reading is missing.
+  //
+  // Required columns:  Timestamp | Session_ID | Defect_Type | Confidence
+  //                    Avg_Temp  | Gas_PPM
+  //
+  // Avg_Temp priority:
+  //   1. event.thermalAvgC    (written by sessionLogger v3 at detection time)
+  //   2. session.avgThermalC  (session average — flush every 15 s)
+  //   3. ""                   (no thermal sensor data)
+  const downloadMissionHistory = useCallback(async () => {
+    setHistLoading(true);
+    try {
+      const [sessSnap, evSnap] = await Promise.all([
+        get(ref(db, "sessions")),
+        get(query(ref(db, "detectionEvents"), orderByChild("timestamp"))),
+      ]);
+
+      // Build sessions lookup
+      const sessMap = {};
+      if (sessSnap.exists()) {
+        sessSnap.forEach(child => { sessMap[child.key] = { ...child.val(), id: child.key }; });
+      }
+
+      const allEvents = [];
+      if (evSnap.exists()) {
+        evSnap.forEach(child => allEvents.push({ ...child.val(), id: child.key }));
+      }
+      allEvents.sort((a, b) => (a.timestamp||0) - (b.timestamp||0));
+
+      if (allEvents.length === 0 && Object.keys(sessMap).length > 0) {
+        // No individual events recorded — fall back to session summary export
+        const hdr = [
+          "Session_ID","Start_Time","End_Time","Duration_s",
+          "Operator","Total_Detections","Peak_Gas_PPM","Avg_Gas_PPM",
+          "Avg_Temp","Status",
+        ];
+        const rows = Object.values(sessMap)
+          .sort((a,b) => (a.startTime||0) - (b.startTime||0))
+          .map(s => [
+            s.id || "",
+            fmtDateTime(s.startTime),
+            fmtDateTime(s.endTime),
+            s.duration ?? "",
+            s.controllerName || "",
+            Object.values(s.detections||{}).reduce((t,c)=>t+c, 0),
+            s.peakGasPpm  != null ? s.peakGasPpm.toFixed(1)  : "",
+            s.avgGasPpm   != null ? s.avgGasPpm.toFixed(1)   : "",
+            s.avgThermalC != null ? s.avgThermalC.toFixed(1) : "",
+            s.status || "",
+          ]);
+        triggerDownload(buildCsvString(hdr, rows),
+          `viper-mission-history-${new Date().toISOString().slice(0,10)}.csv`);
+        return;
+      }
+
+      // Full join: one row per detection event enriched with session data
+      const header = [
+        "Timestamp",
+        "Session_ID",
+        "Defect_Type",
+        "Confidence",
+        "Avg_Temp",
+        "Gas_PPM",
+        // Enrichment columns
+        "Gas_Level",
+        "Operator",
+        "Session_Peak_Gas_PPM",
+        "Session_Avg_Gas_PPM",
+        "Session_Duration_s",
+      ];
+      const rows = allEvents.map(e => {
+        const sess    = sessMap[e.sessionId] || {};
+        const avgTemp = e.thermalAvgC    != null ? e.thermalAvgC.toFixed(1)
+                      : sess.avgThermalC != null ? sess.avgThermalC.toFixed(1)
+                      : "";
+        return [
+          fmtDateTime(e.timestamp),
+          e.sessionId      || "",
+          e.label          || "",
+          e.confidence     != null ? (e.confidence * 100).toFixed(1) + "%" : "",
+          avgTemp,
+          e.gasPpm         != null ? e.gasPpm.toFixed(1) : "",
+          e.gasLevel       || "",
+          sess.controllerName || e.controllerName || "",
+          sess.peakGasPpm  != null ? sess.peakGasPpm.toFixed(1) : "",
+          sess.avgGasPpm   != null ? sess.avgGasPpm.toFixed(1)  : "",
+          sess.duration    != null ? sess.duration               : "",
+        ];
+      });
+      triggerDownload(buildCsvString(header, rows),
+        `viper-mission-history-${new Date().toISOString().slice(0,10)}.csv`);
+    } catch (err) {
+      console.error("Mission history export failed:", err);
+      alert("Export failed — check console for details.");
+    } finally {
+      setHistLoading(false);
+    }
+  }, []);
 
   // ── Label summary (top 8 across filtered events) ──────────────────────────
   const labelCounts = useMemo(() => {
@@ -211,8 +321,21 @@ export default function DetectionLog() {
               {filtered.length.toLocaleString()} event{filtered.length!==1?"s":""}
               {filtered.length < events.length ? ` of ${events.length.toLocaleString()}` : ""}
             </span>
-            <button className="dl-csv-btn" onClick={downloadCSV} disabled={filtered.length===0}>
-              ↓ DOWNLOAD CSV
+            {/* Filtered view CSV — quick export of current results */}
+            <button className="dl-csv-btn" onClick={downloadFilteredCSV} disabled={filtered.length===0}>
+              ↓ EXPORT FILTERED
+            </button>
+            {/* Full history CSV — fetches ALL sessions + ALL events from Firebase */}
+            <button
+              className="dl-csv-btn dl-hist-btn"
+              onClick={downloadMissionHistory}
+              disabled={histLoading}
+              title="Download complete mission history — joins all sessions with all detection events"
+            >
+              {histLoading
+                ? <><span className="dl-spin">◌</span> FETCHING…</>
+                : "⬡ DOWNLOAD MISSION HISTORY"
+              }
             </button>
           </div>
         </div>
@@ -244,6 +367,7 @@ export default function DetectionLog() {
                   <span>CONFIDENCE</span>
                   <span>GAS PPM</span>
                   <span>GAS LEVEL</span>
+                  <span>AVG TEMP</span>
                   <span>OPERATOR</span>
                   <span>SESSION</span>
                 </div>
@@ -273,6 +397,9 @@ export default function DetectionLog() {
                         <span className="dl-gas-lvl" style={{ color:gc, borderColor:gc, background:gc+"18" }}>
                           {e.gasLevel||"—"}
                         </span>
+                      </span>
+                      <span className="dl-temp">
+                        {e.thermalAvgC != null ? `${e.thermalAvgC.toFixed(1)}°C` : "--"}
                       </span>
                       <span className="dl-op">{e.controllerName||"—"}</span>
                       <span className="dl-sess" title={e.sessionId}>

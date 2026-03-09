@@ -365,6 +365,97 @@ class YOLODetector:
                     self._WHITE, 1, cv2.LINE_AA)
 
     # ──────────────────────────────────────────────────────────────────────────
+    # get_defect_size()  — standalone NDT measurement helper
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_defect_size(
+        self,
+        detection: dict,
+        calibration_factor_mm_per_px: float = None,
+    ) -> dict:
+        """
+        Compute the real-world size of any bounding-box detection.
+
+        For crack detections (is_crack=True) the CrackAnalyzer's more
+        accurate skeleton + perpendicular-sampling measurements are used
+        directly (already in the detection dict).
+
+        For non-crack detections (YOLO boxes) the bounding box short-axis
+        is used as a proxy for defect width and the long-axis for length,
+        converted via the calibration factor.
+
+        Parameters
+        ----------
+        detection : dict
+            A single detection dict as returned by detect().
+        calibration_factor_mm_per_px : float | None
+            Override the default scale factor.
+            Default = pipe_diameter_mm / (frame_width_px * pipe_fill_ratio)
+            which equals 1 / px_per_mm from CrackAnalyzer.
+            For a 640-px-wide frame, DN100 pipe, 80% fill:
+                factor = 100 / (640 * 0.80) ≈ 0.195 mm/px
+
+        Returns
+        -------
+        dict with keys:
+            width_px    float  — bounding-box short-axis width in pixels
+            length_px   float  — bounding-box long-axis length in pixels
+            width_mm    float  — converted width in millimetres
+            length_mm   float  — converted length in millimetres
+            source      str    — "crack_analyzer" | "bbox_proxy"
+            label       str    — detection label
+            severity    str    — severity if crack, else "N/A"
+        """
+        # Derive default calibration factor from crack analyzer config
+        if calibration_factor_mm_per_px is None:
+            cfg     = self.analyzer.cfg
+            # px_per_mm = frame_width * fill / pipe_diam
+            # We don't know frame_width here so use 640 as standard reference.
+            # Caller can override with actual frame width if needed.
+            px_per_mm = (640.0 * cfg.pipe_fill_ratio) / cfg.pipe_diameter_mm
+            calibration_factor_mm_per_px = 1.0 / px_per_mm if px_per_mm > 0 else 0.195
+
+        # ── Crack detection: use CrackAnalyzer's measurements directly ──────
+        if detection.get("is_crack"):
+            w_mm = detection.get("width_mm",  0.0)
+            l_mm = detection.get("length_mm", 0.0)
+            w_px = detection.get("width_px",  0.0)
+            l_px = detection.get("length_px", 0.0)
+            # Fall back to bbox-derived values if crack fields missing
+            if w_px == 0.0:
+                x1, y1, x2, y2 = detection["bbox"]
+                bw, bh = abs(x2 - x1), abs(y2 - y1)
+                w_px   = float(min(bw, bh))
+                l_px   = float(max(bw, bh))
+                w_mm   = round(w_px * calibration_factor_mm_per_px, 2)
+                l_mm   = round(l_px * calibration_factor_mm_per_px, 2)
+            return {
+                "label":    detection["label"],
+                "width_px": round(w_px, 1),
+                "length_px":round(l_px, 1),
+                "width_mm": round(w_mm, 2),
+                "length_mm":round(l_mm, 2),
+                "severity": detection.get("severity", "UNKNOWN"),
+                "source":   "crack_analyzer",
+            }
+
+        # ── YOLO detection: derive from bounding box ─────────────────────────
+        x1, y1, x2, y2 = detection["bbox"]
+        bw = abs(x2 - x1)
+        bh = abs(y2 - y1)
+        w_px = float(min(bw, bh))   # short axis = width proxy
+        l_px = float(max(bw, bh))   # long axis  = length proxy
+        return {
+            "label":    detection["label"],
+            "width_px": round(w_px, 1),
+            "length_px":round(l_px, 1),
+            "width_mm": round(w_px * calibration_factor_mm_per_px, 2),
+            "length_mm":round(l_px * calibration_factor_mm_per_px, 2),
+            "severity": "N/A",
+            "source":   "bbox_proxy",
+        }
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Utility
     # ──────────────────────────────────────────────────────────────────────────
 

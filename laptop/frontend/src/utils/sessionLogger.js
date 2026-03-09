@@ -1,4 +1,4 @@
-// utils/sessionLogger.js  v2
+// utils/sessionLogger.js  v3
 //
 // Firebase schema written:
 //
@@ -6,10 +6,13 @@
 //     id, startTime, endTime, duration, controllerUid, controllerName,
 //     detections: { label: count },
 //     peakGasPpm, avgGasPpm, gasReadings: [{t, ppm}],
+//     avgThermalC,                          ← NEW v3: scene avg temp °C
 //     status: "active" | "completed", notes
 //
-//   detectionEvents/{id}:        ← NEW: individual detection events for log page
-//     sessionId, timestamp (epoch ms), label, confidence, gasPpm, gasLevel
+//   detectionEvents/{id}:
+//     sessionId, timestamp (epoch ms), label, confidence,
+//     gasPpm, gasLevel, controllerName,
+//     thermalAvgC                           ← NEW v3: thermal reading at event time
 
 import { ref, set, update, push } from "firebase/database";
 import { db } from "../firebase";
@@ -29,6 +32,11 @@ export class SessionLogger {
     this._lastGasPpm  = null;
     this._lastGasLvl  = "OFFLINE";
     this._flushTimer  = null;
+
+    // Thermal scene temperature tracking (from Pi MLX90640 via /health)
+    this._lastThermalC  = null;   // most recent scene avg °C
+    this._totalThermalC = 0;
+    this._thermalCount  = 0;
 
     // Dedup — don't log same label more than once per second
     this._lastDetTime  = {};
@@ -79,10 +87,19 @@ export class SessionLogger {
           confidence: Math.round((d.confidence || 0) * 100) / 100,
           gasPpm:     this._lastGasPpm,
           gasLevel:   this._lastGasLvl,
+          thermalAvgC: this._lastThermalC,                // ← NEW v3
           controllerName: this.user?.displayName || this.user?.email?.split("@")[0] || "Operator",
         }).catch(() => {});
       }
     }
+  }
+
+  addThermalReading(avgC) {
+    // Called by ControlRoom whenever a new /health response includes thermal_avg_c
+    if (avgC == null || typeof avgC !== "number") return;
+    this._lastThermalC   = avgC;
+    this._totalThermalC += avgC;
+    this._thermalCount  += 1;
   }
 
   addGasReading(ppm, level) {
@@ -100,14 +117,17 @@ export class SessionLogger {
   async _flush() {
     if (!this.sessionRef) return;
     const duration = Math.round((Date.now() - this.startMs) / 1000);
-    const avgGas   = this._gasCount > 0
+    const avgGas     = this._gasCount > 0
       ? Math.round(this._totalPpm / this._gasCount * 10) / 10 : 0;
+    const avgThermal = this._thermalCount > 0
+      ? Math.round(this._totalThermalC / this._thermalCount * 10) / 10 : null;
     await update(this.sessionRef, {
       duration,
-      detections:  this._detections,
-      peakGasPpm:  Math.round(this._peakPpm * 10) / 10,
-      avgGasPpm:   avgGas,
-      gasReadings: this._gasReadings,
+      detections:   this._detections,
+      peakGasPpm:   Math.round(this._peakPpm * 10) / 10,
+      avgGasPpm:    avgGas,
+      avgThermalC:  avgThermal,
+      gasReadings:  this._gasReadings,
     }).catch(() => {});
   }
 

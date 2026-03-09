@@ -985,3 +985,24 @@ body::after {
 .dl-pg-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 .dl-pg-info { font-family: var(--mono); font-size: 11px; color: var(--t0); }
 .dl-pg-sub  { color: var(--t2); font-size: 9px; }
+
+/* ═══════════ DETECTION LOG ADDITIONS ══════════════════════════════════════ */
+.dl-hist-btn {
+  border-color: var(--cd) !important;
+  color: var(--c) !important;
+  background: rgba(0,212,255,0.06) !important;
+  min-width: 200px;
+}
+.dl-hist-btn:hover:not(:disabled) {
+  background: rgba(0,212,255,0.14) !important;
+  box-shadow: 0 0 8px rgba(0,212,255,0.2);
+}
+.dl-hist-btn:disabled { opacity: 0.5; cursor: wait !important; }
+.dl-spin { display: inline-block; animation: spin 0.7s linear infinite; }
+
+/* ═══════════ AVG TEMP COLUMN ═══════════════════════════════════════════════ */
+/* Add Avg Temp column to detection table header/rows */
+.dl-row {
+  grid-template-columns: 1.6fr 1.2fr 0.8fr 0.8fr 0.8fr 0.7fr 1fr 0.6fr;
+}
+.dl-temp { color: var(--c); }

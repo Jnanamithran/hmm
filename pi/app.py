@@ -10,8 +10,43 @@
 #   6. gas.start_thread()      — background 2 Hz polling begins
 # =============================================================================
 
-import logging, signal, sys, os, time
+import logging, signal, sys, os, time, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _read_cpu_temp() -> float | None:
+    """
+    Read Pi CPU temperature in °C.
+
+    Tries three sources in order of reliability:
+      1. vcgencmd measure_temp  — official Pi tool, works on all Pi models.
+         Returns e.g. "temp=52.0'C".
+      2. /sys/class/thermal/thermal_zone0/temp — Linux sysfs interface.
+         Value is in millidegrees Celsius (52000 → 52.0°C).
+      3. Returns None if both fail (non-Pi hardware).
+    """
+    # Method 1 — vcgencmd
+    try:
+        r = subprocess.run(
+            ["vcgencmd", "measure_temp"],
+            capture_output=True, text=True, timeout=1,
+        )
+        # Output: "temp=52.0'C\n"
+        raw = r.stdout.strip()          # "temp=52.0'C"
+        val = raw.split("=")[1].rstrip("'C")
+        return round(float(val), 1)
+    except Exception:
+        pass
+
+    # Method 2 — sysfs thermal zone
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            millideg = int(f.read().strip())
+        return round(millideg / 1000.0, 1)
+    except Exception:
+        pass
+
+    return None
 
 from flask import Flask, Response, jsonify
 from flask_cors import CORS
@@ -90,16 +125,31 @@ def mst(): return jsonify({"direction": motors.direction})
 
 @app.route("/health")
 def health():
-    g = gas.read()
+    g        = gas.read()
+    cpu_temp = _read_cpu_temp()
+
+    # Thermal scene temperature (average of min+max from MLX90640)
+    t_min = thermal.min_temp
+    t_max = thermal.max_temp
+    t_avg = round((t_min + t_max) / 2.0, 1) if (t_min is not None and t_max is not None) else None
+
     return jsonify({
-        "status":         "ok",
-        "camera_open":    camera.is_open,
-        "thermal_sensor": thermal.available,
-        "thermal_min_c":  thermal.min_temp,
-        "thermal_max_c":  thermal.max_temp,
-        "gas_sensor":     gas.available,
-        "gas_ppm":        g.get("ppm"),
-        "gas_level":      g.get("level"),
+        "status":          "ok",
+        "camera_open":     camera.is_open,
+        "thermal_sensor":  thermal.available,
+        "thermal_min_c":   t_min,
+        "thermal_max_c":   t_max,
+        "thermal_avg_c":   t_avg,
+        "gas_sensor":      gas.available,
+        "gas_ppm":         g.get("ppm"),
+        "gas_level":       g.get("level"),
+        # ── System vitals ──────────────────────────────────────────────
+        "pi_temp":         cpu_temp,          # CPU °C (None if unavailable)
+        "pi_temp_status":  (
+            "critical" if cpu_temp is not None and cpu_temp > 70 else
+            "warning"  if cpu_temp is not None and cpu_temp > 55 else
+            "ok"
+        ),
     })
 
 
