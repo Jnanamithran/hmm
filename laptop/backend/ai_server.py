@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PI_IP   = os.environ.get("PI_IP",   "10.42.139.170")
+PI_IP   = os.environ.get("PI_IP",   "10.86.22.170")
 PI_PORT = int(os.environ.get("PI_PORT", "5000"))
 PI_BASE = f"http://{PI_IP}:{PI_PORT}"
 log.info("Pi target: %s", PI_BASE)
@@ -74,10 +74,24 @@ _ai_enabled        = True
 _thermal_enabled   = False   # server-side thermal blend toggle
 _thermal_alpha     = 0.45    # blend weight for thermal (0.0 = camera only, 1.0 = thermal only)
 _pi_connected      = False
+_crack_enabled     = True    # toggle crack detection pipeline
+_defect_lock       = threading.Lock()
+_latest_defect     = {       # last defect report — served at /defects
+    "timestamp":      None,
+    "crack_count":    0,
+    "critical_count": 0,
+    "moderate_count": 0,
+    "minor_count":    0,
+    "worst_severity": "NONE",
+    "max_width_mm":   0.0,
+    "max_length_mm":  0.0,
+    "max_growth_pct": 0.0,
+    "cracks":         [],
+}
 
 # ── Load YOLO ─────────────────────────────────────────────────────────────────
 log.info("Loading YOLOv8n ...")
-detector = YOLODetector(model_path="yolov8n.pt", confidence=0.40)
+detector = YOLODetector(model_path="yolov8n.pt", confidence=0.40, crack_enabled=_crack_enabled)
 detector.warmup()
 log.info("YOLOv8n ready")
 
@@ -170,9 +184,16 @@ def _infer_worker():
             continue
 
         try:
-            # 1. Run YOLO if enabled
+            # 1. Run YOLO + crack pipeline if enabled
             if _ai_enabled:
                 annotated, dets = detector.detect(frame)
+                # Pull latest defect report into shared state
+                from detector.model import latest_defect_report as _ldr
+                if _ldr is not None:
+                    import dataclasses
+                    with _defect_lock:
+                        global _latest_defect
+                        _latest_defect = dataclasses.asdict(_ldr)
             else:
                 annotated, dets = frame, []
 
@@ -512,11 +533,50 @@ def proxy_motor(direction):
         return jsonify({"error": "Pi not reachable"}), 503
 
 
+# ── Defects ───────────────────────────────────────────────────────────────────
+@app.route("/defects")
+def defects():
+    """Latest NDT crack detection report."""
+    with _defect_lock:
+        return jsonify(dict(_latest_defect))
+
+
+@app.route("/crack/toggle", methods=["POST"])
+def crack_toggle():
+    """Toggle the OpenCV crack detection pipeline on/off."""
+    global _crack_enabled
+    _crack_enabled = not _crack_enabled
+    detector.set_crack_enabled(_crack_enabled)
+    log.info("Crack pipeline: %s", "ON" if _crack_enabled else "OFF")
+    return jsonify({"crack_enabled": _crack_enabled})
+
+
+@app.route("/crack/calibrate", methods=["POST"])
+def crack_calibrate():
+    """
+    Update pipe diameter for scale mapping.
+    Body: {"pipe_diameter_mm": 100.0}
+    """
+    data = request.get_json(silent=True) or {}
+    mm   = float(data.get("pipe_diameter_mm", 100.0))
+    mm   = max(10.0, min(2000.0, mm))
+    detector.set_pipe_diameter(mm)
+    return jsonify({"pipe_diameter_mm": mm})
+
+
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.route("/health")
 def health():
     with _gas_lock:
         g = dict(_gas_data)
+    with _defect_lock:
+        defect_summary = {
+            "worst_severity":  _latest_defect["worst_severity"],
+            "crack_count":     _latest_defect["crack_count"],
+            "critical_count":  _latest_defect["critical_count"],
+            "max_width_mm":    _latest_defect["max_width_mm"],
+            "max_length_mm":   _latest_defect["max_length_mm"],
+        }
     return jsonify({
         "status":           "ok",
         "pi_connected":     _pi_connected,
@@ -524,8 +584,10 @@ def health():
         "thermal_enabled":  _thermal_enabled,
         "thermal_online":   _therm_bgr is not None,
         "thermal_alpha":    _thermal_alpha,
+        "crack_enabled":    _crack_enabled,
         "gas":              g,
         "recording":        recorder.status,
+        "defect":           defect_summary,
     })
 
 

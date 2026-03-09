@@ -26,6 +26,18 @@ logging.basicConfig(level=logging.INFO,
                     datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 
+# ── Release /dev/video0 if another process holds it ───────────────────────────
+import subprocess as _sp
+try:
+    _r = _sp.run(["fuser", "/dev/video0"], capture_output=True, text=True)
+    _pids = _r.stdout.strip().split()
+    if _pids:
+        log.warning("Releasing /dev/video0 held by PID(s): %s", " ".join(_pids))
+        _sp.run(["fuser", "-k", "/dev/video0"], capture_output=True)
+        time.sleep(0.5)   # let kernel release the device
+except FileNotFoundError:
+    pass   # fuser not available — skip
+
 app = Flask(__name__)
 CORS(app)
 
