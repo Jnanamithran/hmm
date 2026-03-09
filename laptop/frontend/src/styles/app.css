@@ -1006,3 +1006,66 @@ body::after {
   grid-template-columns: 1.6fr 1.2fr 0.8fr 0.8fr 0.8fr 0.7fr 1fr 0.6fr;
 }
 .dl-temp { color: var(--c); }
+
+/* ═══════════ CPU TEMPERATURE METER (StatusBar.jsx) ════════════════════════ */
+/* CpuTempMeter — Pi hardware health widget in the control-room sidebar.      */
+/* Displays: numeric readout · status tag · colour-coded progress bar         */
+/* with tick marks at 55°C (warning) and 70°C (critical throttle threshold).  */
+
+.cpu-temp-meter {
+  display: flex; flex-direction: column; gap: 6px;
+}
+
+/* Numeric value + unit + status tag ─────────────────────────────────────── */
+.cpu-temp-val-row {
+  display: flex; align-items: baseline; gap: 5px;
+}
+.cpu-temp-val {
+  font-family: var(--disp); font-size: 22px; font-weight: 700;
+  line-height: 1; transition: color 0.6s;
+}
+.cpu-temp-unit {
+  font-family: var(--mono); font-size: 11px; color: var(--t2);
+}
+.cpu-temp-tag {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 2px;
+  padding: 2px 7px; border-radius: 2px; border: 1px solid;
+  margin-left: auto; transition: color 0.6s, border-color 0.6s;
+}
+
+/* Progress bar track + fill + ticks ─────────────────────────────────────── */
+.cpu-temp-track {
+  position: relative; height: 5px; background: var(--bg3);
+  border-radius: 3px; overflow: visible;
+}
+.cpu-temp-fill {
+  height: 100%; border-radius: 3px; min-width: 2px;
+}
+.cpu-temp-tick {
+  position: absolute; top: -3px; width: 1px; height: 11px;
+  background: var(--bdr2); pointer-events: none;
+}
+.cpu-temp-tick:hover::after {
+  content: attr(title);
+  position: absolute; top: -18px; left: 50%; transform: translateX(-50%);
+  font-family: var(--mono); font-size: 8px; color: var(--t2);
+  white-space: nowrap; pointer-events: none;
+}
+
+/* Axis labels below bar (0° / 55°⚠ / 70°⛔ / 90°C) ────────────────────── */
+.cpu-temp-labels {
+  display: flex; justify-content: space-between;
+  font-family: var(--mono); font-size: 8px; color: var(--t2);
+  letter-spacing: 0.5px; margin-top: -2px;
+}
+
+/* Alert / warning text lines ─────────────────────────────────────────────── */
+.cpu-temp-alert {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 1px;
+  padding: 4px 8px; border-radius: 2px; border: 1px solid;
+  animation: pulse 0.8s ease-in-out infinite;
+}
+.cpu-temp-warn {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 1px;
+  color: var(--y);
+}

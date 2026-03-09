@@ -119,7 +119,7 @@ class CrackMeasurement:
     bbox:            Tuple[int,int,int,int]  # (x1, y1, x2, y2) axis-aligned
     centroid:        Tuple[float, float]
     area_px:         int
-    length_px:       float
+    length_px:       float               # centreline length = skeleton pixel count
     width_px:        float
     length_mm:       float
     width_mm:        float
@@ -128,6 +128,14 @@ class CrackMeasurement:
     propagation_pct: float               # area growth % / second (0 if new)
     confidence:      float               # OpenCV-derived confidence score
     crack_id:        str                 # grid-cell-based stable identifier
+    # ── Skeleton image (Zhang-Suen / iterative-erosion) ──────────────────
+    # 1-pixel-wide centreline mask, same shape as `mask`.
+    # Stored here so callers (model.py, ai_server.py) can render the
+    # skeleton overlay directly without re-running thinning.
+    # Optional: None when the mask was too small to skeletonise.
+    skeleton_mask:   Optional[np.ndarray] = field(
+        default=None, repr=False, compare=False, hash=False,
+    )
 
 
 @dataclass
@@ -142,7 +150,34 @@ class DefectReport:
     max_width_mm:      float
     max_length_mm:     float
     max_growth_pct:    float
-    cracks:            List[dict]        # serialisable list of measurements
+    cracks:            List[dict]        # JSON-serialisable measurement list
+    # ── Non-serialisable measurement objects (numpy arrays inside) ────────
+    # Kept here so downstream code (model.py skeleton overlay, ai_server.py
+    # RTDB push) can access skeleton_mask and contour without a second pass.
+    # NEVER pass this to dataclasses.asdict() — use to_dict() instead.
+    measurements: List["CrackMeasurement"] = field(
+        default_factory=list, repr=False, compare=False, hash=False,
+    )
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serialisable snapshot of this report.
+
+        Identical to what dataclasses.asdict() would produce for the scalar
+        fields, but safely skips the `measurements` list which contains
+        numpy arrays (contour, mask, skeleton_mask) that are not serialisable.
+        """
+        return {
+            "timestamp":      self.timestamp,
+            "crack_count":    self.crack_count,
+            "critical_count": self.critical_count,
+            "moderate_count": self.moderate_count,
+            "minor_count":    self.minor_count,
+            "worst_severity": self.worst_severity,
+            "max_width_mm":   self.max_width_mm,
+            "max_length_mm":  self.max_length_mm,
+            "max_growth_pct": self.max_growth_pct,
+            "cracks":         self.cracks,   # already a list[dict]
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -410,7 +445,9 @@ class CrackAnalyzer:
         cv2.drawContours(crack_mask, [contour], -1, 255, cv2.FILLED)
 
         # Skeleton (Zhang-Suen thinning) → centreline length
-        length_px = self._skeleton_length(crack_mask)
+        # _skeleton_length() now returns (count, skel_image) so we retain
+        # the skeleton image for overlay rendering in model.py / ai_server.py.
+        length_px, skeleton_image = self._skeleton_length(crack_mask)
 
         # Width via perpendicular sampling along skeleton
         width_px = self._measure_width(crack_mask, contour)
@@ -441,25 +478,41 @@ class CrackAnalyzer:
             propagation_pct= 0.0,       # overwritten by tracker.update()
             confidence     = round(confidence, 3),
             crack_id       = crack_id,
+            skeleton_mask  = skeleton_image,   # ← centreline image stored here
         )
 
     # ──────────────────────────────────────────────────────────────────────
     # Skeleton length (Zhang-Suen iterative thinning)
     # ──────────────────────────────────────────────────────────────────────
 
-    def _skeleton_length(self, mask: np.ndarray) -> int:
+    def _skeleton_length(self, mask: np.ndarray) -> Tuple[int, np.ndarray]:
         """
-        Thin binary mask to a 1-pixel-wide skeleton and count non-zero pixels.
-        Pixel count ≈ centreline length in pixels.
-        Uses OpenCV's ximgproc thinning if available; falls back to a manual
-        iterative erosion approach which is slower but dependency-free.
+        Thin binary mask to a 1-pixel-wide centreline skeleton and count
+        non-zero pixels.  Pixel count ≈ centreline length in pixels.
+
+        Returns
+        -------
+        (length_px, skeleton_image)
+            length_px      — int, number of lit skeleton pixels (= crack length)
+            skeleton_image — uint8 ndarray, same shape as mask, 255 on
+                             centreline pixels and 0 elsewhere.  Callers can
+                             use this to render the skeleton overlay directly.
+
+        Uses cv2.ximgproc.thinning (Zhang-Suen) when available.
+        Falls back to iterative erosion — slower but dependency-free.
         """
         try:
             import cv2.ximgproc as xip
             skel = xip.thinning(mask, thinningType=xip.THINNING_ZHANGSUEN)
-        except AttributeError:
+        except (AttributeError, ImportError, ModuleNotFoundError):
+            # AttributeError      — ximgproc present but thinning() unavailable
+            # ModuleNotFoundError — opencv-contrib-python not installed (common)
+            # ImportError         — partial install or platform mismatch
+            # All three: fall back to pure-OpenCV iterative erosion skeleton.
+            # To get the faster Zhang-Suen version:
+            #   pip install opencv-contrib-python
             skel = self._manual_skeleton(mask)
-        return int(np.count_nonzero(skel))
+        return int(np.count_nonzero(skel)), skel
 
     def _manual_skeleton(self, mask: np.ndarray) -> np.ndarray:
         """Fallback skeleton via iterative erosion (no ximgproc needed)."""
@@ -653,18 +706,22 @@ class CrackAnalyzer:
 
         cracks_json = [
             {
-                "crack_id":         m.crack_id,
-                "severity":         m.severity,
-                "confidence":       m.confidence,
-                "width_mm":         m.width_mm,
-                "length_mm":        m.length_mm,
-                "width_px":         round(m.width_px, 1),
-                "length_px":        round(m.length_px, 1),
-                "angle_deg":        m.angle_deg,
-                "area_px":          m.area_px,
-                "propagation_pct":  round(m.propagation_pct * 100, 2),
-                "bbox":             list(m.bbox),
-                "centroid":         [round(m.centroid[0], 1), round(m.centroid[1], 1)],
+                "crack_id":           m.crack_id,
+                "severity":           m.severity,
+                "confidence":         m.confidence,
+                "width_mm":           m.width_mm,
+                "length_mm":          m.length_mm,
+                "width_px":           round(m.width_px, 1),
+                "length_px":          round(m.length_px, 1),
+                # skeleton_length_px == length_px (pixel count of Zhang-Suen
+                # centreline), exposed explicitly so consumers don't need to
+                # know the implementation detail.
+                "skeleton_length_px": round(m.length_px, 1),
+                "angle_deg":          m.angle_deg,
+                "area_px":            m.area_px,
+                "propagation_pct":    round(m.propagation_pct * 100, 2),
+                "bbox":               list(m.bbox),
+                "centroid":           [round(m.centroid[0], 1), round(m.centroid[1], 1)],
             }
             for m in measurements
         ]
@@ -680,4 +737,5 @@ class CrackAnalyzer:
             max_length_mm  = max(m.length_mm for m in measurements),
             max_growth_pct = max(m.propagation_pct * 100 for m in measurements),
             cracks         = cracks_json,
+            measurements   = measurements,   # raw objects for overlay rendering
         )

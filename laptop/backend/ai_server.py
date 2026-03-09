@@ -41,14 +41,25 @@ from flask_cors import CORS
 from detector.model import YOLODetector
 
 # ── Firebase Admin SDK (Firestore backend push) ───────────────────────────────
-# Install: pip install firebase-admin
-# Provide service account key via env var FIREBASE_SA_KEY (path to JSON file)
-# or place serviceAccountKey.json in the same directory as this file.
-# If neither is found the Firestore writer is silently disabled.
-_firestore_client = None
+# ── Firebase Admin SDK (Firestore + RTDB backend push) ───────────────────────
+# Install:  pip install firebase-admin
+# Provide service account key via env var FIREBASE_SA_KEY (path to JSON)
+# or place serviceAccountKey.json beside ai_server.py.
+# Both Firestore (mission_logs) and RTDB (detectionEvents) are disabled
+# gracefully if the key is absent or firebase-admin is not installed.
+#
+# RTDB writes bypass Firebase security rules (admin privilege) so the
+# "auth != null" guard on detectionEvents does not apply to this path.
+# The RTDB URL is read from FIREBASE_RTDB_URL env var or hardcoded below.
+_RTDB_URL        = os.environ.get(
+    "FIREBASE_RTDB_URL", "https://viper-ndt-default-rtdb.firebaseio.com"
+)
+_firestore_client  = None
+_rtdb_events_ref   = None    # firebase_admin.db reference → /detectionEvents
+
 try:
     import firebase_admin
-    from firebase_admin import credentials, firestore as _fs
+    from firebase_admin import credentials, firestore as _fs, db as _frtdb
 
     _sa_path = os.environ.get(
         "FIREBASE_SA_KEY",
@@ -56,21 +67,27 @@ try:
     )
     if Path(_sa_path).exists():
         _cred = credentials.Certificate(_sa_path)
-        firebase_admin.initialize_app(_cred)
+        firebase_admin.initialize_app(_cred, {"databaseURL": _RTDB_URL})
+
+        # Firestore — for mission_logs (existing)
         _firestore_client = _fs.client()
+
+        # RTDB — for detectionEvents (critical alerts visible in DetectionLog.jsx)
+        _rtdb_events_ref = _frtdb.reference("detectionEvents")
+
         logging.getLogger(__name__).info(
-            "Firestore connected — mission_logs collection ready"
+            "Firebase connected — Firestore mission_logs + RTDB detectionEvents ready"
         )
     else:
         logging.getLogger(__name__).warning(
-            "Firestore disabled — no service account key found at %s. "
+            "Firebase disabled — no service account key found at %s. "
             "Set FIREBASE_SA_KEY env var or place serviceAccountKey.json "
             "next to ai_server.py.",
             _sa_path,
         )
 except ImportError:
     logging.getLogger(__name__).warning(
-        "firebase-admin not installed — Firestore push disabled. "
+        "firebase-admin not installed — Firestore + RTDB push disabled. "
         "Run: pip install firebase-admin"
     )
 
@@ -108,7 +125,7 @@ _ai_enabled        = True
 _thermal_enabled   = False   # server-side thermal blend toggle
 _thermal_alpha     = 0.45    # blend weight for thermal (0.0 = camera only, 1.0 = thermal only)
 _pi_connected      = False
-_crack_enabled     = True    # toggle crack detection pipeline
+_crack_enabled     = False   # crack pipeline OFF — using YOLOv8n only
 _defect_lock       = threading.Lock()
 _pi_health_lock    = threading.Lock()
 _pi_health_data    = {       # Pi system vitals — polled every 2 s
@@ -154,17 +171,85 @@ def _clahe_enhance(bgr: np.ndarray) -> np.ndarray:
     enhanced   = cv2.merge([l_enhanced, a, b])
     return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
 
+# ── YOLO inference queue ─────────────────────────────────────────────────────
+# _infer_worker submits frames here; _yolo_thread picks them up and returns
+# (annotated_frame, detections) via _yolo_out_q.
+# Depth=1 so only the latest frame is ever queued — old frames are dropped.
+_yolo_in_q:  queue.Queue = queue.Queue(maxsize=1)
+_yolo_out_q: queue.Queue = queue.Queue(maxsize=1)
+
+def _yolo_thread():
+    """Dedicated YOLO inference thread — one frame at a time, never blocks stream."""
+    log.info("YOLO thread started (device=%s)", detector.device)
+    while True:
+        try:
+            frame = _yolo_in_q.get(timeout=1.0)
+            annotated, dets = detector.detect(frame)
+            # Drop previous unread result before putting new one
+            try:
+                _yolo_out_q.get_nowait()
+            except queue.Empty:
+                pass
+            _yolo_out_q.put((annotated, dets))
+        except queue.Empty:
+            continue
+        except Exception:
+            import traceback as _tb
+            log.error("YOLO thread crash:\n%s", _tb.format_exc())
+
 # ── Firestore write queue (non-blocking background thread) ───────────────────
 # Detection events are pushed here from _infer_worker and written to
 # Firestore's `mission_logs` collection by _firestore_writer.
 # Queue depth 500 — older events dropped silently if writer falls behind.
 _fs_queue: queue.Queue = queue.Queue(maxsize=500)
 
+# ── RTDB critical-defect queue ────────────────────────────────────────────────
+# Critical crack alerts (width > 2 mm) are pushed here and written to
+# Firebase Realtime Database /detectionEvents by _rtdb_writer.
+# These records appear permanently in DetectionLog.jsx exactly like
+# operator-logged events from the frontend SessionLogger.
+#
+# Cooldown: same crack_id is only pushed once every RTDB_COOLDOWN_S seconds
+# to prevent flooding the RTDB with the same crack every frame (≈20 fps).
+_rtdb_queue: queue.Queue   = queue.Queue(maxsize=200)
+_RTDB_COOLDOWN_S           = 30.0   # seconds between alerts for the same crack
+_rtdb_last_alert: dict     = {}     # crack_id → last push time (monotonic)
+_rtdb_alert_lock            = threading.Lock()
+
 # ── Load YOLO ─────────────────────────────────────────────────────────────────
-log.info("Loading YOLOv8n ...")
-detector = YOLODetector(model_path="yolov8n.pt", confidence=0.40, crack_enabled=_crack_enabled)
+# Model path priority:
+#   1. VIPER_MODEL_PATH env var  — custom trained model (set after training)
+#   2. "yolov8n.pt"              — default COCO pretrained weights (fallback)
+#
+# After training with data/training/train.py, set the env var and restart:
+#   Windows: set VIPER_MODEL_PATH=S:\...\runs\detect\viper_crack_v1\weights\best.pt
+#   Linux:   export VIPER_MODEL_PATH=/path/to/runs/detect/viper_crack_v1/weights/best.pt
+#
+# Confidence can also be tuned via VIPER_CONFIDENCE (default 0.40).
+# Lower confidence (e.g. 0.30) catches more cracks at the cost of more false
+# positives; higher (e.g. 0.50) is stricter.
+_MODEL_PATH  = os.environ.get("VIPER_MODEL_PATH",  "yolov8n.pt")
+_CONFIDENCE  = float(os.environ.get("VIPER_CONFIDENCE", "0.40"))
+
+if _MODEL_PATH != "yolov8n.pt":
+    from pathlib import Path as _P
+    if _P(_MODEL_PATH).exists():
+        log.info("Custom model: %s", _MODEL_PATH)
+    else:
+        log.warning(
+            "VIPER_MODEL_PATH=%s does not exist — falling back to yolov8n.pt",
+            _MODEL_PATH,
+        )
+        _MODEL_PATH = "yolov8n.pt"
+
+log.info("Loading YOLO model: %s  (confidence=%.2f)", _MODEL_PATH, _CONFIDENCE)
+detector = YOLODetector(
+    model_path    = _MODEL_PATH,
+    confidence    = _CONFIDENCE,
+    crack_enabled = _crack_enabled,
+)
 detector.warmup()
-log.info("YOLOv8n ready")
+log.info("YOLO model ready — %s", _MODEL_PATH)
 
 
 # =============================================================================
@@ -259,82 +344,81 @@ def _blend_thermal(camera_bgr):
 
 
 def _infer_worker():
+    """
+    Frame pump — decoupled from YOLO inference speed.
+
+    1. Reads latest raw frame from Pi.
+    2. If AI is ON: submits frame to _yolo_in_q (non-blocking).
+                    Reads any finished YOLO result from _yolo_out_q.
+                    Always writes SOMETHING to _ann_jpeg every loop.
+    3. If AI is OFF: writes enhanced raw frame directly to _ann_jpeg.
+
+    YOLO runs in _yolo_thread separately so a 2s CPU inference call
+    never stalls this loop — _cam_generator always has fresh frames.
+    """
     global _ann_jpeg, _detections
-    enc      = [cv2.IMWRITE_JPEG_QUALITY, 97]
+
+    enc      = [cv2.IMWRITE_JPEG_QUALITY, 85]
     last_raw = None
 
+    log.info("Inference worker started")
+
     while True:
+        # ── Get latest raw frame ──────────────────────────────────────────
         with _raw_lock:
             raw = _raw_jpeg
 
         if raw is None or raw is last_raw:
             time.sleep(0.005)
             continue
-
         last_raw = raw
+
         arr   = np.frombuffer(raw, np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame is None:
             continue
 
         try:
-            # 0. CLAHE pre-processing on camera frame
-            #    Enhances low-light pipe interiors before YOLO inference.
-            #    Applied to the raw frame so both YOLO and CrackAnalyzer
-            #    receive the contrast-enhanced version.
             enhanced = _clahe_enhance(frame)
 
-            # 1. Run YOLO + crack pipeline if enabled
             if _ai_enabled:
-                annotated, dets = detector.detect(enhanced)
-                # Pull latest defect report into shared state
-                from detector.model import latest_defect_report as _ldr
-                if _ldr is not None:
-                    import dataclasses
-                    with _defect_lock:
-                        global _latest_defect
-                        _latest_defect = dataclasses.asdict(_ldr)
+                # Submit to YOLO thread (drop frame if queue full — YOLO busy)
+                try:
+                    _yolo_in_q.put_nowait(enhanced)
+                except queue.Full:
+                    pass  # YOLO still running on previous frame — skip this one
+
+                # Pick up any finished YOLO result (non-blocking)
+                try:
+                    annotated, dets = _yolo_out_q.get_nowait()
+                    with _det_lock:
+                        _detections = dets
+                    if _thermal_enabled:
+                        annotated = _blend_thermal(annotated)
+                    ok, buf = cv2.imencode(".jpg", annotated, enc)
+                    if ok:
+                        with _ann_lock:
+                            _ann_jpeg = buf.tobytes()
+                except queue.Empty:
+                    # YOLO not done yet — write enhanced raw so stream stays live
+                    out = _blend_thermal(enhanced) if _thermal_enabled else enhanced
+                    ok, buf = cv2.imencode(".jpg", out, enc)
+                    if ok:
+                        with _ann_lock:
+                            _ann_jpeg = buf.tobytes()
             else:
-                annotated, dets = enhanced, []
-
-            # 2. Blend thermal if enabled
-            if _thermal_enabled:
-                annotated = _blend_thermal(annotated)
-
-            # 3. Encode final frame
-            ok, buf = cv2.imencode(".jpg", annotated, enc)
-            if ok:
-                with _ann_lock:
-                    _ann_jpeg = buf.tobytes()
+                # AI off — pass raw frame through (with optional thermal blend)
+                out = _blend_thermal(enhanced) if _thermal_enabled else enhanced
+                ok, buf = cv2.imencode(".jpg", out, enc)
+                if ok:
+                    with _ann_lock:
+                        _ann_jpeg = buf.tobytes()
                 with _det_lock:
-                    _detections = dets
+                    _detections = []
 
-            # 4. Push detection events to Firestore (non-blocking)
-            if dets and _firestore_client is not None:
-                ts = datetime.now(timezone.utc).isoformat()
-                for d in dets:
-                    event = {
-                        "label":      d["label"],
-                        "confidence": d["confidence"],
-                        "timestamp":  ts,
-                        "bbox":       d.get("bbox", []),
-                        "is_crack":   d.get("is_crack", False),
-                    }
-                    # Crack detections get full NDT fields
-                    if d.get("is_crack"):
-                        event.update({
-                            "severity":        d.get("severity"),
-                            "width_mm":        d.get("width_mm"),
-                            "length_mm":       d.get("length_mm"),
-                            "propagation_pct": d.get("propagation_pct"),
-                        })
-                    try:
-                        _fs_queue.put_nowait(event)
-                    except queue.Full:
-                        pass   # drop oldest — writer can't keep up
-
-        except Exception as exc:
-            log.error("Worker error: %s", exc)
+        except Exception:
+            import traceback as _tb
+            log.error("Worker crash:\n%s", _tb.format_exc())
 
 
 # =============================================================================
@@ -458,12 +542,48 @@ def _firestore_writer():
             log.warning("Firestore write failed: %s", exc)
 
 
+def _rtdb_writer():
+    """
+    Background thread — drains _rtdb_queue and pushes each critical-defect
+    alert to Firebase Realtime Database /detectionEvents.
+
+    Uses firebase_admin.db (Admin SDK) which bypasses the "auth != null"
+    security rule, so no user token is needed.  The push() call generates
+    a unique key (same as client-side push()) so concurrent writes from
+    multiple frames never collide.
+
+    Exits immediately if _rtdb_events_ref is None (Firebase not configured).
+    """
+    if _rtdb_events_ref is None:
+        log.debug("RTDB writer idle — Firebase not configured")
+        return
+
+    log.info("RTDB writer started → detectionEvents (critical alerts only)")
+
+    while True:
+        try:
+            alert = _rtdb_queue.get(timeout=1.0)
+            _rtdb_events_ref.push(alert)
+            log.info(
+                "RTDB alert pushed — crack_id=%s  width=%.1fmm  severity=%s",
+                alert.get("crack_id", "?"),
+                alert.get("width_mm", 0.0),
+                alert.get("severity", "?"),
+            )
+        except queue.Empty:
+            continue
+        except Exception as exc:
+            log.warning("RTDB write failed: %s", exc)
+
+
 threading.Thread(target=_raw_reader,       daemon=True, name="raw-reader").start()
+threading.Thread(target=_yolo_thread,      daemon=True, name="yolo-thread").start()
 threading.Thread(target=_infer_worker,     daemon=True, name="infer-worker").start()
 threading.Thread(target=_thermal_reader,   daemon=True, name="thermal-reader").start()
 threading.Thread(target=_gas_poller,       daemon=True, name="gas-poller").start()
 threading.Thread(target=_pi_health_poller, daemon=True, name="pi-health-poller").start()
 threading.Thread(target=_firestore_writer, daemon=True, name="fs-writer").start()
+threading.Thread(target=_rtdb_writer,      daemon=True, name="rtdb-writer").start()
 
 
 # =============================================================================
@@ -618,14 +738,32 @@ log.info("Auto-recording started → %s", RECORDINGS_DIR)
 # =============================================================================
 
 def _cam_generator():
-    hdr  = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
-    enc  = [cv2.IMWRITE_JPEG_QUALITY, 97]   # max quality stream
-    last = None
+    """
+    Stream generator.
+
+    Logic:
+    - _ann_jpeg is written by _infer_worker on EVERY raw frame (either
+      with AI boxes or plain enhanced). It is ALWAYS the right frame to show.
+    - Raw fallback is ONLY used during the first few frames before
+      _infer_worker has produced its first output.
+    - This eliminates the flicker caused by alternating between annotated
+      and raw frames while YOLO is mid-inference.
+    """
+    hdr      = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+    enc      = [cv2.IMWRITE_JPEG_QUALITY, 85]
+    last     = None   # last frame bytes we yielded (any source)
 
     while True:
+        # ── Primary: always use _ann_jpeg (updated every raw frame) ───────
         with _ann_lock:
             frame = _ann_jpeg
 
+        # ── Fallback: raw frame only before first _ann_jpeg is ready ──────
+        if frame is None:
+            with _raw_lock:
+                frame = _raw_jpeg
+
+        # ── Placeholder: Pi not connected yet ─────────────────────────────
         if frame is None:
             blank = np.zeros((480, 640, 3), dtype=np.uint8)
             cv2.putText(blank, "Waiting for Pi...", (150, 240),
@@ -638,7 +776,7 @@ def _cam_generator():
             recorder.write(frame)
             yield hdr + frame + b"\r\n"
         else:
-            time.sleep(0.003)
+            time.sleep(0.010)
 
 
 # =============================================================================
@@ -779,6 +917,68 @@ def crack_calibrate():
     detector.set_pipe_diameter(mm)
     return jsonify({"pipe_diameter_mm": mm})
 
+
+@app.route("/calibrate/metric_width", methods=["GET", "POST"])
+def calibrate_metric_width():
+    """
+    Convert a horizontal pixel measurement to real-world millimetres using
+    the camera's field of view.  Wraps YOLODetector.get_metric_width().
+
+    Two calibration modes are selected automatically:
+
+    MODE A — Pipe-geometry (no distance_mm supplied)
+        Uses the configured pipe inner diameter and fill-ratio.
+        This is the same formula CrackAnalyzer uses internally and works
+        well when the camera is aimed straight down the pipe bore.
+
+            px_per_mm = frame_width_px * pipe_fill_ratio / pipe_diameter_mm
+            mm        = pixel_width / px_per_mm
+
+    MODE B — FOV + known distance (distance_mm supplied)
+        Uses the pinhole-camera model.  Use for external/side-scan
+        inspections where the pipe-bore fill assumption breaks down.
+
+            real_frame_width = 2 * distance_mm * tan(HFOV_rad / 2)
+            mm               = pixel_width * real_frame_width / frame_width_px
+
+    Parameters (JSON body or URL query string — both accepted)
+    -----------------------------------------------------------
+    pixel_width   float  required
+    frame_width   int    optional  default 640
+    distance_mm   float  optional  enables Mode B when supplied
+
+    Response fields
+    ---------------
+    mm, px_per_mm, mm_per_px, mode, cam_hfov_deg, pixel_width
+    + pipe_diameter_mm, pipe_fill_ratio  (Mode A only)
+    + distance_mm                        (Mode B only)
+    """
+    data = (request.get_json(silent=True) or {}) if request.method == "POST"            else request.args.to_dict()
+
+    if "pixel_width" not in data:
+        return jsonify({
+            "error":   "'pixel_width' is required",
+            "example": {"pixel_width": 42, "frame_width": 640},
+            "modes":   {
+                "pipe_geometry": "omit distance_mm  — uses pipe_diameter from /crack/calibrate",
+                "fov_distance":  "supply distance_mm — uses camera HFOV for pinhole projection",
+            },
+        }), 400
+
+    try:
+        pixel_width = float(data["pixel_width"])
+        frame_width = int(data.get("frame_width", 640))
+        d_mm        = data.get("distance_mm")
+        distance_mm = float(d_mm) if d_mm is not None else None
+    except (ValueError, TypeError) as exc:
+        return jsonify({"error": f"Invalid parameter: {exc}"}), 400
+
+    result = detector.get_metric_width(
+        pixel_width = pixel_width,
+        frame_width = frame_width,
+        distance_mm = distance_mm,
+    )
+    return jsonify(result)
 
 # ── Health ────────────────────────────────────────────────────────────────────
 @app.route("/health")

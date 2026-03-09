@@ -49,9 +49,10 @@ export default function ControlRoom() {
   });
 
   // ── Pi system vitals (forwarded through laptop /health) ────────────────────
-  const [piTemp,      setPiTemp]      = useState(null);
-  const [pingMs,      setPingMs]      = useState(null);
-  const [thermalAvgC, setThermalAvgC] = useState(null);
+  const [piTemp,       setPiTemp]       = useState(null);
+  const [piTempStatus, setPiTempStatus] = useState("ok");   // "ok"|"warning"|"critical"
+  const [pingMs,       setPingMs]       = useState(null);
+  const [thermalAvgC,  setThermalAvgC]  = useState(null);
 
   // ── Drive ──────────────────────────────────────────────────────────────────
   const [lastCmd,    setLastCmd]    = useState("stop");
@@ -136,6 +137,7 @@ export default function ControlRoom() {
           if (h.recording) setRecStatus(h.recording);
           // Pi system vitals
           if (h.pi_temp    != null) setPiTemp(h.pi_temp);
+          if (h.pi_temp_status)     setPiTempStatus(h.pi_temp_status);
           if (h.ping_ms    != null) setPingMs(h.ping_ms);
           if (h.thermal_avg_c != null) {
             setThermalAvgC(h.thermal_avg_c);
@@ -284,6 +286,8 @@ export default function ControlRoom() {
                 aiEnabled={aiEnabled}
                 lastCmd={lastCmd}
                 recStatus={recStatus}
+                piTemp={piTemp}
+                piTempStatus={piTempStatus}
               />
             </aside>
           </>

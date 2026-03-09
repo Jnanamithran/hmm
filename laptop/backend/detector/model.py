@@ -96,11 +96,23 @@ class YOLODetector:
         device:        Optional[str] = None,
         crack_config:  Optional[CrackConfig] = None,
         crack_enabled: bool  = True,
+        cam_hfov_deg:  float = 68.0,    # horizontal FOV of the USB camera (degrees)
+                                         # Typical wide-angle USB cam ≈ 60–75°.
+                                         # Used by get_metric_width() when caller
+                                         # supplies a known camera-to-wall distance.
     ):
         logger.info("Loading YOLO model: %s", model_path)
         self.model       = YOLO(model_path)
         self.confidence  = confidence
-        self.device      = device
+        # Pin device explicitly — never leave as None.
+        # ultralytics with device=None re-runs device detection on every call
+        # which adds 100-500ms overhead and can deadlock on Windows with
+        # CPU-only torch due to OpenMP/MKL thread pool conflicts.
+        if device is None:
+            import torch as _torch
+            self.device = 0 if _torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
         self.class_names = self.model.names
 
         # Seeded colour palette — same class = same colour every time
@@ -108,8 +120,9 @@ class YOLODetector:
         self._palette = rng.integers(80, 230, size=(max(len(self.class_names), 1), 3)).tolist()
 
         # NDT crack engine
-        self.crack_enabled = crack_enabled
-        self.analyzer      = CrackAnalyzer(crack_config or CrackConfig())
+        self.crack_enabled  = crack_enabled
+        self.analyzer       = CrackAnalyzer(crack_config or CrackConfig())
+        self.cam_hfov_deg   = float(cam_hfov_deg)
 
         logger.info(
             "YOLODetector ready — %d classes @ conf=%.2f | crack pipeline=%s",
@@ -151,6 +164,8 @@ class YOLODetector:
                 conf    = self.confidence,
                 verbose = False,
                 device  = self.device,
+                stream  = False,   # return list, not generator
+                imgsz   = 640,     # pin shape — avoids per-call reshape overhead
             )[0]
 
             for box in results.boxes:
@@ -179,23 +194,62 @@ class YOLODetector:
                 report = self.analyzer.analyze(frame)
                 latest_defect_report = report
 
+                # ── Skeleton overlay ──────────────────────────────────────
+                # Draw the Zhang-Suen centreline directly on the annotated
+                # frame BEFORE the bounding-box / label pass so the skeleton
+                # appears underneath the measurement panels.
+                #
+                # Each severity uses a distinct colour that contrasts with
+                # the bounding-box colour:
+                #   MINOR    → bright cyan   (#00FFFF)  — thin crack, easy to see
+                #   MODERATE → yellow        (#FFFF00)  — attention-level
+                #   CRITICAL → white         (#FFFFFF)  — maximum contrast on
+                #              the crimson fill so NDT engineers can trace it
+                SKEL_COLORS = {
+                    "MINOR":    (255, 255,   0),   # cyan  BGR
+                    "MODERATE": (  0, 255, 255),   # yellow BGR
+                    "CRITICAL": (255, 255, 255),   # white BGR
+                }
+                for m in report.measurements:
+                    if m.skeleton_mask is None:
+                        continue
+                    skel_color = SKEL_COLORS.get(m.severity, (0, 255, 255))
+                    # Dilate 1 px so the 1-px-wide skeleton is visible on screen
+                    skel_vis = cv2.dilate(
+                        m.skeleton_mask,
+                        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
+                    )
+                    # Colorise skeleton pixels without affecting the rest
+                    skel_layer = np.zeros_like(annotated)
+                    skel_layer[skel_vis > 0] = skel_color
+                    # Blend at full opacity on top of current annotated frame
+                    cv2.addWeighted(skel_layer, 0.85, annotated, 1.0, 0, annotated)
+
+                # ── Per-crack detection dicts + bounding-box drawing ──────
                 for crack in report.cracks:
                     self._draw_crack(annotated, crack)
 
                     detections.append({
-                        "label":           f"crack ({crack['severity']})",
-                        "confidence":      crack["confidence"],
-                        "bbox":            crack["bbox"],
-                        "cls_id":          -1,
-                        "is_crack":        True,
-                        "severity":        crack["severity"],
-                        "width_mm":        crack["width_mm"],
-                        "length_mm":       crack["length_mm"],
-                        "angle_deg":       crack["angle_deg"],
-                        "area_px":         crack["area_px"],
-                        "propagation_pct": crack["propagation_pct"],
-                        "crack_id":        crack["crack_id"],
-                        "centroid":        crack["centroid"],
+                        "label":              f"crack ({crack['severity']})",
+                        "confidence":         crack["confidence"],
+                        "bbox":               crack["bbox"],
+                        "cls_id":             -1,
+                        "is_crack":           True,
+                        "severity":           crack["severity"],
+                        "width_mm":           crack["width_mm"],
+                        "length_mm":          crack["length_mm"],
+                        "angle_deg":          crack["angle_deg"],
+                        "area_px":            crack["area_px"],
+                        "propagation_pct":    crack["propagation_pct"],
+                        "crack_id":           crack["crack_id"],
+                        "centroid":           crack["centroid"],
+                        # skeleton_length_px: Zhang-Suen centreline pixel count.
+                        # Sourced from CrackMeasurement.length_px which is set
+                        # by CrackAnalyzer._skeleton_length() — the value is the
+                        # count of non-zero pixels in the thinned skeleton image.
+                        # This is the most accurate crack-length proxy available
+                        # without physical contact measurement.
+                        "skeleton_length_px": crack["skeleton_length_px"],
                     })
 
                 if report.critical_count > 0:
@@ -453,6 +507,112 @@ class YOLODetector:
             "length_mm":round(l_px * calibration_factor_mm_per_px, 2),
             "severity": "N/A",
             "source":   "bbox_proxy",
+        }
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # get_metric_width()  — FOV-based pixel → mm calibration
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def get_metric_width(
+        self,
+        pixel_width:   float,
+        frame_width:   int   = 640,
+        distance_mm:   Optional[float] = None,
+    ) -> dict:
+        """
+        Convert a horizontal pixel measurement to real-world millimetres
+        using the camera's field of view.
+
+        This method backs the ``GET /calibrate/metric_width`` REST endpoint
+        in ai_server.py, which accepts the same parameters via JSON body or
+        URL query string.
+
+        Two calibration modes are selected automatically:
+
+        MODE A — Pipe-geometry (default, ``distance_mm`` omitted)
+        ----------------------------------------------------------
+        Uses the known pipe inner diameter and fill-ratio assumption.
+        The same formula CrackAnalyzer uses internally, so results are
+        consistent with the crack mm measurements served on /defects.
+
+            px_per_mm = frame_width * pipe_fill_ratio / pipe_diameter_mm
+            mm        = pixel_width / px_per_mm
+
+        Pipe diameter is set via ``/crack/calibrate`` (default: DN100 = 100 mm).
+
+        MODE B — FOV + known camera-to-surface distance
+        ------------------------------------------------
+        Uses the pinhole-camera model.  Suitable for external inspection
+        or any scenario where the camera does NOT look straight down the
+        bore.
+
+            real_frame_width = 2 * distance_mm * tan(HFOV_rad / 2)
+            mm_per_px        = real_frame_width / frame_width
+            mm               = pixel_width * mm_per_px
+
+        Parameters
+        ----------
+        pixel_width : float
+            Horizontal extent of the feature in pixels.
+        frame_width : int
+            Width of the frame in pixels.  Defaults to 640 (Pi USB camera).
+        distance_mm : float | None
+            Camera-to-surface distance in mm.
+            Provide to select Mode B; omit to use Mode A.
+
+        Returns
+        -------
+        dict
+            ``mm``               — real-world width in millimetres
+            ``px_per_mm``        — calibration scale factor used
+            ``mm_per_px``        — reciprocal of px_per_mm
+            ``mode``             — ``"pipe_geometry"`` | ``"fov_distance"``
+            ``pipe_diameter_mm`` — active pipe diameter (Mode A only)
+            ``pipe_fill_ratio``  — active fill ratio   (Mode A only)
+            ``distance_mm``      — the input distance   (Mode B only)
+            ``cam_hfov_deg``     — configured camera HFOV (always present)
+            ``pixel_width``      — the original pixel_width echoed back
+
+        Notes
+        -----
+        ``cam_hfov_deg`` defaults to 68° which is a typical estimate for
+        USB webcams with 3.6 mm lenses.  Pass the exact value from your
+        camera's spec sheet to ``__init__`` for higher accuracy in Mode B.
+        The pipe-geometry mode (Mode A) is independent of HFOV.
+        """
+        import math
+
+        if distance_mm is not None:
+            # ── Mode B: FOV + known distance ─────────────────────────────
+            hfov_rad   = math.radians(self.cam_hfov_deg)
+            real_width = 2.0 * float(distance_mm) * math.tan(hfov_rad / 2.0)
+            mm_per_px  = real_width / max(frame_width, 1)
+            px_per_mm  = 1.0 / mm_per_px if mm_per_px > 0 else 0.0
+            mm         = round(pixel_width * mm_per_px, 3)
+            return {
+                "mm":               mm,
+                "px_per_mm":        round(px_per_mm, 4),
+                "mm_per_px":        round(mm_per_px, 6),
+                "mode":             "fov_distance",
+                "distance_mm":      float(distance_mm),
+                "cam_hfov_deg":     self.cam_hfov_deg,
+                "pixel_width":      pixel_width,
+            }
+
+        # ── Mode A: pipe-geometry (default) ──────────────────────────────
+        cfg       = self.analyzer.cfg
+        px_per_mm = (float(frame_width) * cfg.pipe_fill_ratio) / cfg.pipe_diameter_mm
+        mm_per_px = 1.0 / px_per_mm if px_per_mm > 0 else 0.0
+        mm        = round(pixel_width / px_per_mm, 3) if px_per_mm > 0 else 0.0
+        return {
+            "mm":               mm,
+            "px_per_mm":        round(px_per_mm, 4),
+            "mm_per_px":        round(mm_per_px, 6),
+            "mode":             "pipe_geometry",
+            "pipe_diameter_mm": cfg.pipe_diameter_mm,
+            "pipe_fill_ratio":  cfg.pipe_fill_ratio,
+            "cam_hfov_deg":     self.cam_hfov_deg,
+            "pixel_width":      pixel_width,
         }
 
     # ──────────────────────────────────────────────────────────────────────────
