@@ -39,6 +39,7 @@ export default function DetectionLog() {
   const navigate = useNavigate();
 
   const [events,      setEvents]      = useState([]);
+  const [sessions,    setSessions]    = useState([]);
   const [loading,     setLoading]     = useState(true);
   const [search,      setSearch]      = useState("");
   const [gasFilter,   setGasFilter]   = useState("all");
@@ -46,6 +47,7 @@ export default function DetectionLog() {
   const [dateTo,      setDateTo]      = useState("");
   const [page,        setPage]        = useState(1);
   const [histLoading, setHistLoading] = useState(false);
+  const [activeView,  setActiveView]  = useState("events"); // "events" | "sessions"
   const PAGE_SIZE = 50;
 
   useEffect(() => {
@@ -59,6 +61,22 @@ export default function DetectionLog() {
       setLoading(false);
     });
     return unsub;
+  }, []);
+
+  // ── Load sessions list for per-session CSV download ──────────────────────
+  useEffect(() => {
+    const q2 = query(ref(db, "sessions"), orderByChild("startTime"));
+    const unsub2 = onValue(q2, snap => {
+      if (!snap.exists()) { setSessions([]); return; }
+      const arr = [];
+      snap.forEach(child => {
+        const s = child.val();
+        if (s.status === "completed") arr.push({ ...s, id: child.key });
+      });
+      arr.sort((a,b) => b.startTime - a.startTime);
+      setSessions(arr);
+    });
+    return unsub2;
   }, []);
 
   // ── Filtering ────────────────────────────────────────────────────────────
@@ -214,6 +232,49 @@ export default function DetectionLog() {
     }
   }, []);
 
+  // ── Per-session CSV download ─────────────────────────────────────────────
+  const downloadSessionCSV = useCallback((session) => {
+    const sessionEvents = events.filter(e => e.sessionId === session.id);
+    if (sessionEvents.length === 0) {
+      // No individual events — create summary row from session data
+      const hdr = ["Session_ID","Start_Time","End_Time","Duration_s","Operator",
+                   "Total_Detections","Peak_Gas_PPM","Avg_Gas_PPM","Status"];
+      const row = [
+        session.id,
+        fmtDateTime(session.startTime),
+        fmtDateTime(session.endTime),
+        session.duration ?? "",
+        session.controllerName || "",
+        Object.values(session.detections||{}).reduce((t,c)=>t+c,0),
+        session.peakGasPpm != null ? session.peakGasPpm.toFixed(1) : "",
+        session.avgGasPpm  != null ? session.avgGasPpm.toFixed(1)  : "",
+        session.status || "",
+      ];
+      const fname = `viper-session-${fmtDate(session.startTime).replace(/ /g,"-")}.csv`;
+      triggerDownload(buildCsvString(hdr, [row]), fname);
+      return;
+    }
+    sessionEvents.sort((a,b) => (a.timestamp||0) - (b.timestamp||0));
+    const header = ["Timestamp","Session_ID","Defect_Type","Confidence",
+                    "Avg_Temp","Gas_PPM","Gas_Level","Operator"];
+    const rows = sessionEvents.map(e => [
+      fmtDateTime(e.timestamp),
+      e.sessionId   || "",
+      e.label       || "",
+      e.confidence  != null ? (e.confidence * 100).toFixed(1) + "%" : "",
+      e.thermalAvgC != null ? e.thermalAvgC.toFixed(1) : "",
+      e.gasPpm      != null ? e.gasPpm.toFixed(1)      : "",
+      e.gasLevel    || "",
+      e.controllerName || session.controllerName || "",
+    ]);
+    const dateStr = fmtDate(session.startTime).replace(/ /g,"-");
+    const timeStr = fmtTime(session.startTime).replace(/:/g,"h");
+    triggerDownload(
+      buildCsvString(header, rows),
+      `viper-session-${dateStr}-${timeStr}.csv`,
+    );
+  }, [events]);
+
   // ── Label summary (top 8 across filtered events) ──────────────────────────
   const labelCounts = useMemo(() => {
     const m = {};
@@ -256,6 +317,82 @@ export default function DetectionLog() {
       </header>
 
       <div className="dash-body">
+
+        {/* ── View switcher ── */}
+        <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+          <button
+            className={`dash-tab ${activeView==="events"?"dash-tab-active":""}`}
+            onClick={()=>setActiveView("events")}
+          >◎ ALL EVENTS</button>
+          <button
+            className={`dash-tab ${activeView==="sessions"?"dash-tab-active":""}`}
+            onClick={()=>setActiveView("sessions")}
+          >⬡ BY SESSION — DOWNLOAD CSV PER RUN</button>
+        </div>
+
+        {/* ══ SESSION CSV DOWNLOAD VIEW ══════════════════════════════════════ */}
+        {activeView==="sessions" && (
+          <div className="dash-card" style={{padding:0,overflow:"hidden"}}>
+            <div style={{padding:"12px 16px",borderBottom:"1px solid var(--bdr2)",display:"flex",alignItems:"center",gap:10}}>
+              <div className="dash-card-title">
+                ALL INSPECTION RUNS
+                <span className="dash-badge">{sessions.length}</span>
+              </div>
+              <span style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--t2)",marginLeft:"auto"}}>
+                Click ↓ CSV on any row to download that run's detections
+              </span>
+            </div>
+            {sessions.length===0 ? (
+              <div className="dash-empty">No completed sessions found.</div>
+            ) : (
+              <div className="dl-session-panel" style={{maxHeight:560,overflowY:"auto",padding:"10px 12px"}}>
+                <div style={{
+                  display:"grid",gridTemplateColumns:"1.6fr 0.8fr 1fr 0.7fr 0.8fr auto",
+                  padding:"6px 12px",fontFamily:"var(--mono)",fontSize:10,
+                  letterSpacing:2,color:"var(--t2)",borderBottom:"1px solid var(--bdr2)",
+                  marginBottom:4,
+                }}>
+                  <span>DATE & TIME</span><span>OPERATOR</span><span>DURATION</span>
+                  <span>DETECTIONS</span><span>GAS LEVEL</span><span></span>
+                </div>
+                {sessions.map(s => {
+                  const g  = {
+                    safe:"lv-safe",low:"lv-low",warning:"lv-warning",
+                    danger:"lv-danger",offline:"lv-offline",
+                  }[(s.peakGasPpm>=5000?"danger":s.peakGasPpm>=1000?"warning":s.peakGasPpm>=50?"low":s.peakGasPpm>=0?"safe":"offline")];
+                  const dc = Object.values(s.detections||{}).reduce((a,v)=>a+v,0);
+                  const evCount = events.filter(e=>e.sessionId===s.id).length;
+                  return (
+                    <div key={s.id} className="dl-session-csv-row"
+                      style={{display:"grid",gridTemplateColumns:"1.6fr 0.8fr 1fr 0.7fr 0.8fr auto",alignItems:"center"}}>
+                      <span className="dl-session-date">
+                        <span>{fmtDate(s.startTime)}</span>
+                        <span style={{color:"var(--t2)",fontSize:10,marginLeft:8}}>{fmtTime(s.startTime)}</span>
+                      </span>
+                      <span className="dl-session-who">{s.controllerName||"—"}</span>
+                      <span className="dl-session-dur" style={{color:"var(--c)"}}>{
+                        s.duration ? `${Math.floor(s.duration/60)}m ${s.duration%60}s` : "—"
+                      }</span>
+                      <span style={{color:"var(--t1)",fontFamily:"var(--mono)",fontSize:12}}>{dc} det.</span>
+                      <span className={`gas-hdr-badge ${g||"lv-offline"}`} style={{fontSize:10,padding:"2px 8px",width:"fit-content"}}>
+                        {s.peakGasPpm>=5000?"DANGER":s.peakGasPpm>=1000?"WARN":s.peakGasPpm>=50?"LOW":s.peakGasPpm>=0?"SAFE":"—"}
+                      </span>
+                      <button
+                        className="dl-session-dl-btn"
+                        onClick={()=>downloadSessionCSV(s)}
+                        title={`${evCount} detection events · ${fmtDate(s.startTime)} ${fmtTime(s.startTime)}`}
+                      >
+                        ↓ CSV
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeView==="events" && (<>
 
         {/* ── Label summary chips ── */}
         {labelCounts.length > 0 && (
@@ -430,6 +567,8 @@ export default function DetectionLog() {
             </>
           )}
         </div>
+
+        </>)} {/* end activeView===events */}
       </div>
     </div>
   );

@@ -75,3 +75,31 @@ firebase-debug.log
 *.swp
 
 laptop/frontend/login.json
+
+
+
+@"
+# Datasets (too large)
+data/pipe_dataset_*/
+data/pipe_only/
+data/pipe_multi/
+data/training/datasets/train/
+data/training/datasets/valid/
+data/training/datasets/test/
+
+# Model weights (use releases instead)
+*.pt
+!runs/detect/viper_pipe_v1/weights/best.pt
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Recordings
+recordings/
+
+# Cache
+*.cache
+*.npy
+"@ | Out-File -Encoding utf8 .gitignore

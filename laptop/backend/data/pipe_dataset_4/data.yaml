@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 7
+names: ['Buckling', 'Crack', 'Debris', 'Hole', 'Joint offset', 'Obstacle', 'Utility intrusion']
+
+roboflow:
+  workspace: sewage-defect-detection-s68df
+  project: sewage-defect-detection
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/sewage-defect-detection-s68df/sewage-defect-detection/dataset/1

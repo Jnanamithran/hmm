@@ -53,6 +53,8 @@ export default function ControlRoom() {
   const [piTempStatus, setPiTempStatus] = useState("ok");   // "ok"|"warning"|"critical"
   const [pingMs,       setPingMs]       = useState(null);
   const [thermalAvgC,  setThermalAvgC]  = useState(null);
+  const [thermalMinC,  setThermalMinC]  = useState(null);   // MLX90640 scene coldest pixel
+  const [thermalMaxC,  setThermalMaxC]  = useState(null);   // MLX90640 scene hottest pixel
 
   // ── Drive ──────────────────────────────────────────────────────────────────
   const [lastCmd,    setLastCmd]    = useState("stop");
@@ -143,6 +145,9 @@ export default function ControlRoom() {
             setThermalAvgC(h.thermal_avg_c);
             loggerRef.current?.addThermalReading(h.thermal_avg_c);
           }
+          // MLX90640 scene min/max — used by IrThermalBox in StatusBar
+          if (h.thermal_min_c != null) setThermalMinC(h.thermal_min_c);
+          if (h.thermal_max_c != null) setThermalMaxC(h.thermal_max_c);
         }
       } catch {}
     };
@@ -199,7 +204,7 @@ export default function ControlRoom() {
       {/* ══ HEADER ══════════════════════════════════════════════════════════ */}
       <header className="header">
         <div className="header-left">
-          <div className="brand">
+          <div className="brand" style={{cursor:"pointer"}} onClick={()=>navigate("/")}>
             <span className="brand-viper">VIPER</span>
             <span className="brand-ctrl">CTRL</span>
           </div>
@@ -288,6 +293,9 @@ export default function ControlRoom() {
                 recStatus={recStatus}
                 piTemp={piTemp}
                 piTempStatus={piTempStatus}
+                thermalAvgC={thermalAvgC}
+                thermalMinC={thermalMinC}
+                thermalMaxC={thermalMaxC}
               />
             </aside>
           </>

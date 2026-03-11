@@ -119,16 +119,28 @@ class YOLODetector:
         rng = np.random.default_rng(seed=42)
         self._palette = rng.integers(80, 230, size=(max(len(self.class_names), 1), 3)).tolist()
 
-        # NDT crack engine
-        self.crack_enabled  = crack_enabled
-        self.analyzer       = CrackAnalyzer(crack_config or CrackConfig())
+        # NDT crack engine — only initialised when actually needed.
+        # CrackAnalyzer loads OpenCV NDT routines + allocates morph kernels;
+        # skipping it saves ~80 MB RSS and ~200 ms startup time when running
+        # YOLO-only (the normal operating mode with best.pt).
+        self.crack_enabled = crack_enabled
+        self._crack_config  = crack_config   # stash for lazy init
+        self._analyzer      = None           # created on first use
         self.cam_hfov_deg   = float(cam_hfov_deg)
 
         logger.info(
-            "YOLODetector ready — %d classes @ conf=%.2f | crack pipeline=%s",
-            len(self.class_names), confidence,
-            "ON" if crack_enabled else "OFF",
+            "YOLODetector ready — %d classes @ conf=%.2f | device=%s | crack=%s",
+            len(self.class_names), confidence, self.device,
+            "ON" if crack_enabled else "OFF (YOLO-only)",
         )
+
+    @property
+    def analyzer(self) -> "CrackAnalyzer":
+        """Lazy-init CrackAnalyzer on first access — only when crack pipeline is on."""
+        if self._analyzer is None:
+            self._analyzer = CrackAnalyzer(self._crack_config or CrackConfig())
+            logger.info("CrackAnalyzer initialised (first use)")
+        return self._analyzer
 
     # ──────────────────────────────────────────────────────────────────────────
     # detect()
@@ -620,10 +632,11 @@ class YOLODetector:
     # ──────────────────────────────────────────────────────────────────────────
 
     def warmup(self):
-        """Pre-load both pipelines into memory with one dummy frame."""
+        """Pre-warm YOLO pipeline with one dummy frame (CrackAnalyzer not included)."""
         dummy = np.zeros((480, 640, 3), dtype=np.uint8)
-        self.detect(dummy)
-        logger.info("YOLODetector warmed up (YOLO + CrackAnalyzer)")
+        results = self.model(dummy, conf=self.confidence, verbose=False,
+                             device=self.device, stream=False, imgsz=640)
+        logger.info("YOLODetector warmed up (YOLO pipeline)")
 
     def set_crack_enabled(self, enabled: bool):
         self.crack_enabled = enabled

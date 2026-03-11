@@ -1,0 +1,5 @@
+train: S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\data\pipe_only/train/images
+val: S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\data\pipe_only/valid/images
+test: S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\data\pipe_only/test/images
+nc: 1
+names: ['crack']

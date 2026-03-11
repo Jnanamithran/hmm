@@ -139,17 +139,15 @@ _pi_health_data    = {       # Pi system vitals — polled every 2 s
     "pi_thermal_sensor":None,
     "pi_gas_sensor":    None,
 }
-_latest_defect     = {       # last defect report — served at /defects
+# _latest_defect: crack pipeline is OFF — always returns safe defaults.
+# Re-enable by setting _crack_enabled = True and restarting.
+_latest_defect = {
     "timestamp":      None,
     "crack_count":    0,
     "critical_count": 0,
-    "moderate_count": 0,
-    "minor_count":    0,
     "worst_severity": "NONE",
     "max_width_mm":   0.0,
     "max_length_mm":  0.0,
-    "max_growth_pct": 0.0,
-    "cracks":         [],
 }
 
 # ── CLAHE engine (created once, thread-safe for read-only apply) ──────────────
@@ -204,17 +202,9 @@ def _yolo_thread():
 _fs_queue: queue.Queue = queue.Queue(maxsize=500)
 
 # ── RTDB critical-defect queue ────────────────────────────────────────────────
-# Critical crack alerts (width > 2 mm) are pushed here and written to
-# Firebase Realtime Database /detectionEvents by _rtdb_writer.
-# These records appear permanently in DetectionLog.jsx exactly like
-# operator-logged events from the frontend SessionLogger.
-#
-# Cooldown: same crack_id is only pushed once every RTDB_COOLDOWN_S seconds
-# to prevent flooding the RTDB with the same crack every frame (≈20 fps).
-_rtdb_queue: queue.Queue   = queue.Queue(maxsize=200)
-_RTDB_COOLDOWN_S           = 30.0   # seconds between alerts for the same crack
-_rtdb_last_alert: dict     = {}     # crack_id → last push time (monotonic)
-_rtdb_alert_lock            = threading.Lock()
+# Reserved for future use when crack pipeline is re-enabled.
+# Currently empty — crack pipeline is OFF (YOLO-only mode).
+_rtdb_queue: queue.Queue = queue.Queue(maxsize=200)
 
 # ── Load YOLO ─────────────────────────────────────────────────────────────────
 # Model path priority:
@@ -228,19 +218,19 @@ _rtdb_alert_lock            = threading.Lock()
 # Confidence can also be tuned via VIPER_CONFIDENCE (default 0.40).
 # Lower confidence (e.g. 0.30) catches more cracks at the cost of more false
 # positives; higher (e.g. 0.50) is stricter.
-_MODEL_PATH  = os.environ.get("VIPER_MODEL_PATH",  "yolov8n.pt")
-_CONFIDENCE  = float(os.environ.get("VIPER_CONFIDENCE", "0.40"))
+_DEFAULT_MODEL = r"S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\runs\detect\viper_crack_v1\weights\best.pt"
+_MODEL_PATH  = os.environ.get("VIPER_MODEL_PATH", _DEFAULT_MODEL)
+_CONFIDENCE  = float(os.environ.get("VIPER_CONFIDENCE", "0.35"))
 
 if _MODEL_PATH != "yolov8n.pt":
-    from pathlib import Path as _P
-    if _P(_MODEL_PATH).exists():
-        log.info("Custom model: %s", _MODEL_PATH)
-    else:
-        log.warning(
-            "VIPER_MODEL_PATH=%s does not exist — falling back to yolov8n.pt",
-            _MODEL_PATH,
-        )
+    _mp = Path(_MODEL_PATH)
+    if not _mp.exists():
+        log.warning("VIPER_MODEL_PATH=%s not found — falling back to yolov8n.pt", _MODEL_PATH)
         _MODEL_PATH = "yolov8n.pt"
+    elif _mp.stat().st_size < 1024:
+        log.warning("VIPER_MODEL_PATH=%s is too small (%d bytes) — may be corrupt", _MODEL_PATH, _mp.stat().st_size)
+    else:
+        log.info("Custom model: %s  (%.1f MB)", _MODEL_PATH, _mp.stat().st_size / 1e6)
 
 log.info("Loading YOLO model: %s  (confidence=%.2f)", _MODEL_PATH, _CONFIDENCE)
 detector = YOLODetector(
@@ -250,6 +240,11 @@ detector = YOLODetector(
 )
 detector.warmup()
 log.info("YOLO model ready — %s", _MODEL_PATH)
+log.info("=" * 60)
+log.info("  ACTIVE MODEL : %s", _MODEL_PATH)
+log.info("  CONFIDENCE   : %.2f", _CONFIDENCE)
+log.info("  CRACK PIPE   : %s", "ON" if _crack_enabled else "OFF")
+log.info("=" * 60)
 
 
 # =============================================================================
@@ -283,6 +278,10 @@ def _raw_reader():
             r.raise_for_status()
             _pi_connected = True
             log.info("Pi camera connected")
+            # Start recording on first real Pi connection (not at module load)
+            if not recorder._running:
+                recorder.start()
+                log.info("Auto-recording started → %s", RECORDINGS_DIR)
             for jpg in _iter_mjpeg(r):
                 with _raw_lock:
                     _raw_jpeg = jpg
@@ -583,7 +582,11 @@ threading.Thread(target=_thermal_reader,   daemon=True, name="thermal-reader").s
 threading.Thread(target=_gas_poller,       daemon=True, name="gas-poller").start()
 threading.Thread(target=_pi_health_poller, daemon=True, name="pi-health-poller").start()
 threading.Thread(target=_firestore_writer, daemon=True, name="fs-writer").start()
-threading.Thread(target=_rtdb_writer,      daemon=True, name="rtdb-writer").start()
+# Only start RTDB writer if Firebase RTDB is configured (avoids idle thread)
+if _rtdb_events_ref is not None:
+    threading.Thread(target=_rtdb_writer, daemon=True, name="rtdb-writer").start()
+else:
+    log.debug("RTDB writer not started — Firebase RTDB not configured")
 
 
 # =============================================================================
@@ -729,8 +732,9 @@ class VideoRecorder:
 
 
 recorder = VideoRecorder(fps=20, width=640, height=480)  # MJPG .avi, near-lossless
-recorder.start()
-log.info("Auto-recording started → %s", RECORDINGS_DIR)
+# Recording is started on first successful Pi connection in _raw_reader,
+# not at module load — prevents recordings full of black placeholder frames.
+log.info("Recorder ready — will auto-start on Pi connection → %s", RECORDINGS_DIR)
 
 
 # =============================================================================
@@ -773,7 +777,12 @@ def _cam_generator():
 
         if frame is not last:
             last = frame
-            recorder.write(frame)
+            # Only record real frames — skip the "Waiting for Pi" placeholder
+            # so recordings never start with black frames before Pi connects.
+            with _raw_lock:
+                pi_has_frame = _raw_jpeg is not None
+            if pi_has_frame:
+                recorder.write(frame)
             yield hdr + frame + b"\r\n"
         else:
             time.sleep(0.010)
@@ -834,10 +843,12 @@ def thermal_opacity():
 
 @app.route("/thermal/status")
 def thermal_status():
+    with _therm_lock:
+        online = _therm_bgr is not None
     return jsonify({
         "thermal_enabled": _thermal_enabled,
         "thermal_alpha":   _thermal_alpha,
-        "thermal_online":  _therm_bgr is not None,
+        "thermal_online":  online,
     })
 
 
@@ -985,22 +996,25 @@ def calibrate_metric_width():
 def health():
     with _gas_lock:
         g = dict(_gas_data)
-    with _defect_lock:
-        defect_summary = {
-            "worst_severity":  _latest_defect["worst_severity"],
-            "crack_count":     _latest_defect["crack_count"],
-            "critical_count":  _latest_defect["critical_count"],
-            "max_width_mm":    _latest_defect["max_width_mm"],
-            "max_length_mm":   _latest_defect["max_length_mm"],
-        }
+    # _latest_defect is never written while crack pipeline is OFF.
+    # Snapshot without lock — values are always the safe defaults.
+    defect_summary = {
+        "worst_severity":  _latest_defect["worst_severity"],
+        "crack_count":     _latest_defect["crack_count"],
+        "critical_count":  _latest_defect["critical_count"],
+        "max_width_mm":    _latest_defect["max_width_mm"],
+        "max_length_mm":   _latest_defect["max_length_mm"],
+    }
     with _pi_health_lock:
         pi_h = dict(_pi_health_data)
+    with _therm_lock:
+        thermal_online = _therm_bgr is not None
     return jsonify({
         "status":            "ok",
         "pi_connected":      _pi_connected,
         "ai_enabled":        _ai_enabled,
         "thermal_enabled":   _thermal_enabled,
-        "thermal_online":    _therm_bgr is not None,
+        "thermal_online":    thermal_online,
         "thermal_alpha":     _thermal_alpha,
         "crack_enabled":     _crack_enabled,
         "gas":               g,

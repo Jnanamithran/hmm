@@ -51,6 +51,7 @@ export default function Dashboard() {
   const [selected,  setSelected]  = useState(null);
   const [filter,    setFilter]    = useState("all");
   const [activeTab, setActiveTab] = useState("overview");
+  const [alertSort, setAlertSort] = useState("date"); // "date" | "ppm"
 
   useEffect(() => {
     const q = query(ref(db,"sessions"), orderByChild("startTime"));
@@ -113,6 +114,16 @@ export default function Dashboard() {
   const gasAlerts = sessions.filter(s=>(s.peakGasPpm||0)>=1000)
     .sort((a,b)=>b.startTime-a.startTime);
 
+  const sortedAlerts = alertSort === "ppm"
+    ? [...gasAlerts].sort((a,b)=>(b.peakGasPpm||0)-(a.peakGasPpm||0))
+    : gasAlerts;
+
+  // Last run (single most recent session)
+  const lastRun = sessions[0] || null;
+  const lastRunDets = lastRun ? Object.values(lastRun.detections||{}).reduce((a,v)=>a+v,0) : 0;
+  const lastRunTopDets = lastRun ? Object.entries(lastRun.detections||{}).sort((a,b)=>b[1]-a[1]).slice(0,5) : [];
+  const lastRunGas = gasLvl(lastRun?.peakGasPpm);
+
   // Operator stats
   const opMap = {};
   sessions.forEach(s => {
@@ -136,7 +147,7 @@ export default function Dashboard() {
       {/* HEADER */}
       <header className="dash-header">
         <div className="dash-header-left">
-          <div className="dash-brand">
+          <div className="dash-brand" style={{cursor:"pointer"}} onClick={()=>navigate("/")}>
             <span className="dash-brand-v">VIPER</span>
             <span className="dash-brand-sub">NDT</span>
           </div>
@@ -193,43 +204,46 @@ export default function Dashboard() {
             <KpiCard icon="⚠" label="HIGH GAS ALERTS"   value={highAlert}         color={highAlert>0?"red":"green"}/>
           </div>
 
-          {/* THIS WEEK SPOTLIGHT */}
+          {/* LAST RUN SPOTLIGHT */}
           <div className="dash-week-spotlight">
             <div className="dash-week-header">
               <div className="dash-week-title">
                 <span className="dash-week-dot"/>
-                THIS WEEK'S INSPECTION REPORT
+                LAST RUN REPORT
               </div>
-              <div className="dash-week-range">
-                {fmtDate(now-7*86400000)} — {fmtDate(now)}
-              </div>
+              {lastRun && (
+                <div className="dash-week-range">
+                  {fmtDate(lastRun.startTime)} {fmtTime(lastRun.startTime)}
+                  {lastRun.controllerName ? ` · ${lastRun.controllerName}` : ""}
+                </div>
+              )}
             </div>
-            {thisWeek.length===0 ? (
+            {!lastRun ? (
               <div className="dash-empty" style={{padding:"20px 0"}}>
-                No inspections this week yet.
+                No inspections recorded yet.
               </div>
             ) : (
               <div className="dash-week-body">
                 <div className="dash-week-kpis">
-                  <WeekKpi label="RUNS"        value={thisWeek.length}/>
-                  <WeekKpi label="DETECTIONS"  value={weekTotalDets}/>
-                  <WeekKpi label="PEAK GAS"    value={`${weekMaxGas.toFixed(0)} PPM`} danger={weekMaxGas>=1000}/>
-                  <WeekKpi label="GAS ALERTS"  value={weekAlerts} danger={weekAlerts>0}/>
+                  <WeekKpi label="DURATION"   value={fmtDur(lastRun.duration)}/>
+                  <WeekKpi label="DETECTIONS" value={lastRunDets}/>
+                  <WeekKpi label="PEAK GAS"   value={`${(lastRun.peakGasPpm||0).toFixed(0)} PPM`} danger={(lastRun.peakGasPpm||0)>=1000}/>
+                  <WeekKpi label="GAS STATUS" value={lastRunGas.txt} danger={(lastRun.peakGasPpm||0)>=1000}/>
                 </div>
 
                 <div className="dash-week-dets">
-                  <div className="dash-week-dets-title">TOP DETECTED OBJECTS THIS WEEK</div>
-                  {weekTopDets.length===0 ? (
+                  <div className="dash-week-dets-title">TOP DETECTIONS THIS RUN</div>
+                  {lastRunTopDets.length===0 ? (
                     <div style={{fontFamily:"var(--mono)",fontSize:11,color:"var(--t2)",padding:"8px 0"}}>
-                      No object detections logged this week.
+                      No object detections logged this run.
                     </div>
-                  ) : weekTopDets.map(([lbl,cnt],i)=>(
+                  ) : lastRunTopDets.map(([lbl,cnt],i)=>(
                     <div key={lbl} className="week-det-row">
                       <span className="week-det-rank">#{i+1}</span>
                       <span className="week-det-lbl">{lbl.toUpperCase()}</span>
                       <div className="week-det-bar">
                         <div className="week-det-fill" style={{
-                          width:`${Math.round(cnt/weekTopDets[0][1]*100)}%`,
+                          width:`${Math.round(cnt/lastRunTopDets[0][1]*100)}%`,
                           background:PIE_COLORS[i],
                         }}/>
                       </div>
@@ -239,8 +253,8 @@ export default function Dashboard() {
                 </div>
 
                 <div className="dash-week-sessions">
-                  <div className="dash-week-dets-title">THIS WEEK'S SESSIONS</div>
-                  {thisWeek.map(s=>{
+                  <div className="dash-week-dets-title">RECENT RUNS (LAST 5)</div>
+                  {sessions.slice(0,5).map(s=>{
                     const g = gasLvl(s.peakGasPpm);
                     const dc = Object.values(s.detections||{}).reduce((a,v)=>a+v,0);
                     return (
@@ -365,16 +379,28 @@ export default function Dashboard() {
           <div className="dash-alerts-layout">
             <div className="dash-alerts-header">
               <div className="dash-alerts-title">⚠ GAS ALERT LOG — PEAK GAS ≥ 1000 PPM</div>
-              <div className="dash-alerts-count">{gasAlerts.length} alert{gasAlerts.length!==1?"s":""} recorded</div>
+              <div className="dash-alerts-count">{gasAlerts.length} alert{gasAlerts.length!==1?"s":""} total across all history</div>
             </div>
+
+            {/* Sort controls */}
+            {gasAlerts.length>0 && (
+              <div className="dash-alerts-sort">
+                <span className="dash-alerts-sort-lbl">SORT BY:</span>
+                <button className={`dash-sort-btn ${alertSort==="date"?"active":""}`}
+                  onClick={()=>setAlertSort("date")}>DATE (NEWEST FIRST)</button>
+                <button className={`dash-sort-btn ${alertSort==="ppm"?"active":""}`}
+                  onClick={()=>setAlertSort("ppm")}>HIGHEST GAS FIRST</button>
+              </div>
+            )}
+
             {gasAlerts.length===0 ? (
               <div className="dash-empty" style={{marginTop:40}}>No gas alerts recorded. All clear.</div>
             ) : (<>
               <div className="dash-card" style={{marginBottom:14}}>
-                <div className="dash-card-title">PEAK GAS PPM PER ALERT SESSION (LATEST 20)</div>
-                <ResponsiveContainer width="100%" height={180}>
+                <div className="dash-card-title">PEAK GAS PPM — ALL ALERT SESSIONS</div>
+                <ResponsiveContainer width="100%" height={200}>
                   <BarChart
-                    data={[...gasAlerts].reverse().slice(-20).map(s=>({
+                    data={[...gasAlerts].reverse().map(s=>({
                       date: fmtDate(s.startTime).replace(/ \d{4}$/,""),
                       ppm:  Math.round(s.peakGasPpm||0),
                     }))}
@@ -385,7 +411,7 @@ export default function Dashboard() {
                     <YAxis tick={{fontSize:9,fill:"#527a65"}}/>
                     <Tooltip contentStyle={TT} formatter={v=>[`${v} PPM`,"Peak Gas"]}/>
                     <Bar dataKey="ppm" name="Peak PPM" radius={[3,3,0,0]}>
-                      {[...gasAlerts].reverse().slice(-20).map((s,i)=>(
+                      {[...gasAlerts].reverse().map((s,i)=>(
                         <Cell key={i} fill={(s.peakGasPpm||0)>=5000?"#ff3333":"#ffa826"}/>
                       ))}
                     </Bar>
@@ -394,13 +420,16 @@ export default function Dashboard() {
               </div>
 
               <div className="dash-card">
-                <div className="dash-card-title">ALERT SESSIONS</div>
-                <div className="dash-alert-list">
+                <div className="dash-card-title">
+                  ALL ALERT SESSIONS
+                  <span className="dash-badge">{sortedAlerts.length}</span>
+                </div>
+                <div className="dash-alert-list" style={{overflowY:"auto",maxHeight:420}}>
                   <div className="alert-list-hdr">
                     <span>DATE & TIME</span><span>OPERATOR</span><span>DURATION</span>
                     <span>PEAK GAS</span><span>LEVEL</span><span>DETECTIONS</span>
                   </div>
-                  {gasAlerts.map(s=>{
+                  {sortedAlerts.map(s=>{
                     const g  = gasLvl(s.peakGasPpm);
                     const dc = Object.values(s.detections||{}).reduce((a,v)=>a+v,0);
                     return (
@@ -411,10 +440,10 @@ export default function Dashboard() {
                         <span>{fmtDate(s.startTime)} {fmtTime(s.startTime)}</span>
                         <span>{s.controllerName||"—"}</span>
                         <span>{fmtDur(s.duration)}</span>
-                        <span style={{color:g.color,fontFamily:"var(--disp)",fontSize:13}}>
+                        <span style={{color:g.color,fontFamily:"var(--disp)",fontSize:14,fontWeight:700}}>
                           {(s.peakGasPpm||0).toFixed(0)} PPM
                         </span>
-                        <span className={`gas-hdr-badge ${g.cls}`} style={{fontSize:9,padding:"2px 8px"}}>{g.txt}</span>
+                        <span className={`gas-hdr-badge ${g.cls}`} style={{fontSize:10,padding:"2px 8px"}}>{g.txt}</span>
                         <span>{dc}</span>
                       </div>
                     );
