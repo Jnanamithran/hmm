@@ -1,147 +1,243 @@
-// utils/sessionLogger.js  v3
+// utils/sessionLogger.js — v6
+// =============================================================================
+// HOW DETECTION LOGGING WORKS:
 //
-// Firebase schema written:
+//   Each time YOLO detects something, it gets logged as a SEPARATE ROW in
+//   Firebase "detectionEvents" with:
+//     - sessionId    → same for all detections in one session
+//     - timestamp    → exact time this detection happened
+//     - label        → "Crack", "Hole", etc.
+//     - confidence   → model confidence %
+//     - gas_ppm      → gas PPM AT THAT EXACT MOMENT
+//     - distance_m   → distance rover has travelled AT THAT MOMENT
+//     - thermalAvgC  → thermal reading AT THAT MOMENT
 //
-//   sessions/{id}:
-//     id, startTime, endTime, duration, controllerUid, controllerName,
-//     detections: { label: count },
-//     peakGasPpm, avgGasPpm, gasReadings: [{t, ppm}],
-//     avgThermalC,                          ← NEW v3: scene avg temp °C
-//     status: "active" | "completed", notes
+//   Example — one session, 3 cracks at different times:
+//     sessionId: abc  label: Crack  time: 10:01:05  ppm: 12   dist: 0.45m
+//     sessionId: abc  label: Crack  time: 10:01:38  ppm: 15   dist: 1.20m
+//     sessionId: abc  label: Crack  time: 10:02:11  ppm: 18   dist: 2.05m
 //
-//   detectionEvents/{id}:
-//     sessionId, timestamp (epoch ms), label, confidence,
-//     gasPpm, gasLevel, controllerName,
-//     thermalAvgC                           ← NEW v3: thermal reading at event time
+// DEDUPLICATION:
+//   Only skips if the EXACT SAME crack at EXACT SAME position was logged
+//   in the last 3 seconds. This prevents logging the same crack 30×/sec
+//   while the rover is stationary. Once the rover moves, bbox changes
+//   → treated as a new detection and logged again.
+//
+// =============================================================================
 
-import { ref, set, update, push } from "firebase/database";
+import { ref, push, set } from "firebase/database";
 import { db } from "../firebase";
+
+const SAME_BBOX_COOLDOWN_MS = 3000;
+
+// Round bbox to nearest 10px — small jitter = same crack
+function _bboxKey(d) {
+  if (!d.bbox) return "no-bbox";
+  return d.bbox.map(v => Math.round(v / 10) * 10).join(",");
+}
+
+function _fingerprint(d) {
+  return `${d.label || "?"} | ${_bboxKey(d)}`;
+}
 
 export class SessionLogger {
   constructor(user) {
-    this.user       = user;
-    this.sessionRef = null;
-    this.sessionId  = null;
-    this.startMs    = null;
+    this._user       = user;
+    this._sessionRef = null;
+    this._sessionId  = null;
+    this.startMs     = null;
+    this.isLogging   = false;
 
-    this._detections  = {};
-    this._gasReadings = [];
-    this._totalPpm    = 0;
-    this._gasCount    = 0;
-    this._peakPpm     = 0;
-    this._lastGasPpm  = null;
-    this._lastGasLvl  = "OFFLINE";
-    this._flushTimer  = null;
+    this._lastLogged    = {};   // { fingerprint: timestamp } — bbox dedup
+    this._lastPrune     = 0;
 
-    // Thermal scene temperature tracking (from Pi MLX90640 via /health)
-    this._lastThermalC  = null;   // most recent scene avg °C
-    this._totalThermalC = 0;
+    // Session aggregates
+    this._detections    = {};   // { label: count }
+    this._peakPpm       = 0;
+    this._totalPpm      = 0;
+    this._gasCount      = 0;
+    this._totalThermal  = 0;
     this._thermalCount  = 0;
-
-    // Dedup — don't log same label more than once per second
-    this._lastDetTime  = {};
-    this._DET_COOLDOWN = 2000; // ms between logging same label
+    this._peakDistanceM = 0;
+    this._lastFlush     = 0;
   }
 
-  async start() {
-    this.startMs      = Date.now();
-    const sessRef     = push(ref(db, "sessions"));
-    this.sessionRef   = sessRef;
-    this.sessionId    = sessRef.key;
+  // ── Session control ──────────────────────────────────────────────────────
 
-    await set(sessRef, {
-      id:             this.sessionId,
+  async start() {
+    if (this.isLogging) return;
+
+    this.startMs     = Date.now();
+    this.isLogging   = true;
+    this._sessionRef = push(ref(db, "sessions"));
+    this._sessionId  = this._sessionRef.key;
+
+    // Reset all state
+    this._lastLogged    = {};
+    this._lastPrune     = 0;
+    this._detections    = {};
+    this._peakPpm       = 0;
+    this._totalPpm      = 0;
+    this._gasCount      = 0;
+    this._totalThermal  = 0;
+    this._thermalCount  = 0;
+    this._peakDistanceM = 0;
+    this._lastFlush     = 0;
+
+    await set(this._sessionRef, {
       startTime:      this.startMs,
-      endTime:        null,
-      duration:       0,
-      controllerUid:  this.user?.uid  || "unknown",
-      controllerName: this.user?.displayName || this.user?.email?.split("@")[0] || "Operator",
+      controllerName: this._user?.displayName || this._user?.email || "Unknown",
+      controllerUid:  this._user?.uid || null,
+      status:         "active",
       detections:     {},
       peakGasPpm:     0,
       avgGasPpm:      0,
-      gasReadings:    [],
-      status:         "active",
+      avgThermalC:    null,
+      peakDistanceM:  0,
+      duration:       0,
     });
 
-    this._flushTimer = setInterval(() => this._flush(), 15_000);
-    return this.sessionId;
+    console.log("[SessionLogger] Session started:", this._sessionId);
   }
 
-  addDetections(detectionArray) {
-    if (!detectionArray?.length || !this.sessionId) return;
-    const now = Date.now();
+  async stop() {
+    if (!this.isLogging || !this._sessionRef) return;
+    this.isLogging = false;
+    await this.finish();
+  }
 
-    for (const d of detectionArray) {
-      const lbl = d.label || "unknown";
-      this._detections[lbl] = (this._detections[lbl] || 0) + 1;
+  // ── Detection logging ────────────────────────────────────────────────────
 
-      // Write individual detection event — cooldown to avoid spam
-      const lastT = this._lastDetTime[lbl] || 0;
-      if (now - lastT > this._DET_COOLDOWN) {
-        this._lastDetTime[lbl] = now;
-        const evRef = push(ref(db, "detectionEvents"));
-        set(evRef, {
-          sessionId:  this.sessionId,
-          timestamp:  now,
-          label:      lbl,
-          confidence: Math.round((d.confidence || 0) * 100) / 100,
-          gasPpm:     this._lastGasPpm,
-          gasLevel:   this._lastGasLvl,
-          thermalAvgC: this._lastThermalC,                // ← NEW v3
-          controllerName: this.user?.displayName || this.user?.email?.split("@")[0] || "Operator",
-        }).catch(() => {});
+  addDetections(dets, distanceM = 0) {
+    if (!dets?.length || !this._sessionRef || !this.isLogging) return;
+
+    const now    = Date.now();
+    let newFound = false;
+
+    dets.forEach(d => {
+      const label       = d.label || "Unknown";
+      const fingerprint = _fingerprint(d);
+      const lastTime    = this._lastLogged[fingerprint] || 0;
+
+      // Skip if same crack at same position logged within 3s
+      if (now - lastTime < SAME_BBOX_COOLDOWN_MS) return;
+
+      // ── New unique detection — log as individual row ──────────────────
+      newFound = true;
+      this._lastLogged[fingerprint] = now;
+
+      // Update session aggregate count
+      this._detections[label] = (this._detections[label] || 0) + 1;
+      if (distanceM > this._peakDistanceM) this._peakDistanceM = distanceM;
+
+      // Write individual event to Firebase
+      const eventRef = push(ref(db, "detectionEvents"));
+      set(eventRef, {
+        sessionId:      this._sessionId,
+        controllerName: this._user?.displayName || this._user?.email || "Unknown",
+        timestamp:      now,
+        label,
+        confidence:     d.confidence     ?? null,
+        distance_m:     d.distance_m     ?? distanceM,
+        gas_ppm:        d.gas_ppm        ?? null,
+        gasLevel:       d.gas_level      ?? "OFFLINE",
+        thermalAvgC:    d.thermal_avg_c  ?? null,
+        bbox:           d.bbox           ?? null,
+      })
+      .then(() => {
+        const t   = new Date(now).toLocaleTimeString("en-GB");
+        const ppm = d.gas_ppm != null ? `${d.gas_ppm.toFixed(1)} PPM` : "no gas";
+        console.log(`[SessionLogger] ✓ ${label} | ${distanceM.toFixed(2)}m | ${ppm} | ${t}`);
+      })
+      .catch(e => console.error("[SessionLogger] Write failed:", e));
+    });
+
+    // Prune stale fingerprints every 60s
+    if (now - this._lastPrune > 60000) {
+      this._lastPrune = now;
+      for (const [fp, t] of Object.entries(this._lastLogged)) {
+        if (now - t > SAME_BBOX_COOLDOWN_MS * 3) delete this._lastLogged[fp];
       }
     }
+
+    if (newFound) this._flushSession();
+  }
+
+  // ── Gas + thermal ────────────────────────────────────────────────────────
+
+  addGasReading(ppm, level) {
+    if (ppm == null || !this.isLogging) return;
+    if (ppm > this._peakPpm) this._peakPpm = ppm;
+    this._totalPpm += ppm;
+    this._gasCount++;
+    this._flushSession();
   }
 
   addThermalReading(avgC) {
-    // Called by ControlRoom whenever a new /health response includes thermal_avg_c
-    if (avgC == null || typeof avgC !== "number") return;
-    this._lastThermalC   = avgC;
-    this._totalThermalC += avgC;
-    this._thermalCount  += 1;
+    if (avgC == null || !this.isLogging) return;
+    this._totalThermal += avgC;
+    this._thermalCount++;
   }
 
-  addGasReading(ppm, level) {
-    if (ppm == null || ppm < 0) return;
-    const t = Date.now() - this.startMs;
-    this._gasReadings.push({ t, ppm });
-    this._totalPpm  += ppm;
-    this._gasCount  += 1;
-    this._lastGasPpm = ppm;
-    this._lastGasLvl = level || "OFFLINE";
-    if (ppm > this._peakPpm) this._peakPpm = ppm;
-    if (this._gasReadings.length > 500) this._gasReadings.shift();
+  // ── Session summary flush (max once per 5s) ──────────────────────────────
+
+  _flushSession() {
+    const now = Date.now();
+    if (now - this._lastFlush < 5000) return;
+    this._lastFlush = now;
+    if (!this._sessionRef || !this.isLogging) return;
+
+    set(this._sessionRef, {
+      startTime:      this.startMs,
+      controllerName: this._user?.displayName || this._user?.email || "Unknown",
+      controllerUid:  this._user?.uid || null,
+      status:         "active",
+      detections:     { ...this._detections },
+      peakGasPpm:     this._peakPpm,
+      avgGasPpm:      this._gasCount > 0
+                        ? Math.round(this._totalPpm / this._gasCount * 10) / 10
+                        : 0,
+      avgThermalC:    this._thermalCount > 0
+                        ? Math.round(this._totalThermal / this._thermalCount * 10) / 10
+                        : null,
+      peakDistanceM:  this._peakDistanceM,
+      duration:       Math.round((Date.now() - this.startMs) / 1000),
+    }).catch(e => console.error("[SessionLogger] Flush failed:", e));
   }
 
-  async _flush() {
-    if (!this.sessionRef) return;
+  // ── Finish session ───────────────────────────────────────────────────────
+
+  async finish() {
+    if (!this._sessionRef) return;
+    const sessionRef = this._sessionRef;
+    this._sessionRef = null;
+    this.isLogging   = false;
+
     const duration = Math.round((Date.now() - this.startMs) / 1000);
-    const avgGas     = this._gasCount > 0
-      ? Math.round(this._totalPpm / this._gasCount * 10) / 10 : 0;
-    const avgThermal = this._thermalCount > 0
-      ? Math.round(this._totalThermalC / this._thermalCount * 10) / 10 : null;
-    await update(this.sessionRef, {
-      duration,
-      detections:   this._detections,
-      peakGasPpm:   Math.round(this._peakPpm * 10) / 10,
-      avgGasPpm:    avgGas,
-      avgThermalC:  avgThermal,
-      gasReadings:  this._gasReadings,
-    }).catch(() => {});
-  }
 
-  async finish(notes = "") {
-    clearInterval(this._flushTimer);
-    if (!this.sessionRef) return;
-    await this._flush();
-    const duration = Math.round((Date.now() - this.startMs) / 1000);
-    await update(this.sessionRef, {
-      endTime:  Date.now(),
+    await set(sessionRef, {
+      startTime:      this.startMs,
+      endTime:        Date.now(),
+      controllerName: this._user?.displayName || this._user?.email || "Unknown",
+      controllerUid:  this._user?.uid || null,
+      status:         "completed",
       duration,
-      status:   "completed",
-      notes,
-    }).catch(() => {});
-    this.sessionRef = null;
+      detections:     { ...this._detections },
+      peakGasPpm:     this._peakPpm,
+      avgGasPpm:      this._gasCount > 0
+                        ? Math.round(this._totalPpm / this._gasCount * 10) / 10
+                        : 0,
+      avgThermalC:    this._thermalCount > 0
+                        ? Math.round(this._totalThermal / this._thermalCount * 10) / 10
+                        : null,
+      peakDistanceM:  this._peakDistanceM,
+    }).catch(e => console.error("[SessionLogger] Finish failed:", e));
+
+    console.log("[SessionLogger] Session finished:", {
+      id:         sessionRef.key,
+      duration:   `${duration}s`,
+      detections: this._detections,
+      peakGas:    `${this._peakPpm} PPM`,
+    });
   }
 }

@@ -1,23 +1,37 @@
 # =============================================================================
-# pi/camera/usb_camera.py  —  USB Camera with background reader thread  v2
+# pi/camera/usb_camera.py  —  USB Camera with background reader thread  v3
 # =============================================================================
-# FIX: Use path string "/dev/videoN" instead of integer index.
-# On Pi, cv2.VideoCapture(0) goes through OpenCV's device-enumeration which
-# can fail when /dev/video0 is a UVC device alongside ISP/codec devices.
-# cv2.VideoCapture("/dev/video0") opens V4L2 directly by path — always works.
+# FIX v3: Buffer drain to eliminate stale-frame delay.
+#
+# Root cause of delay:
+#   cv2.CAP_PROP_BUFFERSIZE=1 is silently ignored by V4L2 on most Pi kernels.
+#   The driver still queues 3-4 frames internally. Every cap.read() returns
+#   the OLDEST buffered frame — not the current one — causing visible lag.
+#
+# Fix:
+#   Call cap.grab() in a tight loop to drain all queued frames, then
+#   cap.retrieve() to decode only the freshest one. This gives ~0 buffer lag.
+#
+# Also:
+#   - Explicit CAP_V4L2 backend — faster open, skips GStreamer probe
+#   - Reduced encode sleep for tighter frame loop
 # =============================================================================
 
 import cv2, threading, time, logging, os
 
 log = logging.getLogger(__name__)
 
+# How many grab() calls to drain the V4L2 buffer before retrieve().
+# 3 is enough for the default 3-frame V4L2 queue.
+_DRAIN_FRAMES = 3
+
 
 class USBCamera:
     def __init__(self, device_index=0, resolution=(640, 480), jpeg_quality=75):
-        self.device_index  = device_index
-        self.device_path   = f"/dev/video{device_index}"
+        self.device_index       = device_index
+        self.device_path        = f"/dev/video{device_index}"
         self.width, self.height = resolution
-        self.jpeg_quality  = jpeg_quality
+        self.jpeg_quality       = jpeg_quality
 
         self._cap     = None
         self._jpeg    = None
@@ -33,8 +47,8 @@ class USBCamera:
             log.error("Device not found: %s", self.device_path)
             return
 
-        # Open by path string — bypasses OpenCV's broken index enumeration on Pi
-        self._cap = cv2.VideoCapture(self.device_path)
+        # CAP_V4L2 backend: opens V4L2 directly, skips GStreamer/FFMPEG probe
+        self._cap = cv2.VideoCapture(self.device_path, cv2.CAP_V4L2)
 
         if not self._cap.isOpened():
             log.error("Cannot open %s", self.device_path)
@@ -43,12 +57,14 @@ class USBCamera:
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self._cap.set(cv2.CAP_PROP_FPS,          30)
+        # Request smallest buffer — V4L2 may ignore this but try anyway
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
         self._cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
         w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        log.info("Camera opened: %dx%d @ %s", w, h, self.device_path)
+        fps = int(self._cap.get(cv2.CAP_PROP_FPS))
+        log.info("Camera opened: %dx%d @ %dfps → %s", w, h, fps, self.device_path)
 
     def _start_thread(self):
         self._running = True
@@ -72,10 +88,20 @@ class USBCamera:
                 time.sleep(1)
                 self._open_cap()
                 continue
-            ret, frame = self._cap.read()
-            if not ret:
-                time.sleep(0.05)
+
+            # ── KEY FIX: drain the V4L2 buffer ──────────────────────────────
+            # grab() pulls a frame from the driver queue WITHOUT decoding it.
+            # Calling it _DRAIN_FRAMES times discards stale buffered frames.
+            # retrieve() then decodes only the freshest grabbed frame.
+            for _ in range(_DRAIN_FRAMES):
+                self._cap.grab()
+            ret, frame = self._cap.retrieve()
+            # ────────────────────────────────────────────────────────────────
+
+            if not ret or frame is None:
+                time.sleep(0.01)
                 continue
+
             ok, buf = cv2.imencode(".jpg", frame, enc)
             if ok:
                 with self._lock:

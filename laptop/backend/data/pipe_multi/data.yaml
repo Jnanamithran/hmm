@@ -1,0 +1,5 @@
+train: S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\data\pipe_multi\train\images
+val: S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\data\pipe_multi\valid\images
+test: S:\Dev\Program\VIPER\VIPER-vx\laptop\backend\data\pipe_multi\test\images
+nc: 7
+names: ['Buckling', 'Crack', 'Debris', 'Hole', 'Joint_offset', 'Obstacle', 'Utility_intrusion']
