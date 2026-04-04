@@ -3,48 +3,127 @@
 # =========================
 .DS_Store
 Thumbs.db
+*.swp
+*.tmp
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
 
 # =========================
 # Python
 # =========================
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
 
 # Virtual environments
-venv/
-venv*/
+.env
+.venv
 env/
-.env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# Sphinx documentation
+/docs/_build/
+
+# PyInstaller
+*.manifest
+*.spec
 
 # =========================
-# AI / ML models
+# Node / React / JavaScript
 # =========================
-*.pt
-*.pth
-*.onnx
-
-# =========================
-# Recordings / Data
-# =========================
-recordings/
-*.mp4
-*.avi
-*.mkv
-
-# =========================
-# Node / React
-# =========================
+# Dependencies
 node_modules/
-dist/
-build/
-
-# Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+.pnpm-debug.log*
+
+# Build outputs
+dist/
+build/
+out/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache
+.cache
+.parcel-cache
+
+# Next.js build output
+.next/
+out/
+
+# Nuxt.js build / generate output
+.nuxt/
+dist/
+
+# Gatsby files
+.cache/
+public/
+
+# vuepress build output
+.vuepress/dist/
+
+# Serverless directories
+.serverless/
+
+# Fuse.js cache
+.fuse.js/
 
 # =========================
 # Environment variables
@@ -53,33 +132,26 @@ yarn-error.log*
 .env.local
 .env.development
 .env.production
+.env.test
+.env.staging
+*.env
 
 # =========================
-# Firebase
+# AI / ML models and data
 # =========================
-.firebase/
-firebase-debug.log
+# Model weights (use releases instead)
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pkl
+*.pickle
+*.joblib
 
-# =========================
-# IDE
-# =========================
-.vscode/*
-!.vscode/extensions.json
-!.vscode/settings.json
-.idea/
+# TensorBoard logs
+runs/
 
-# =========================
-# Misc
-# =========================
-*.tmp
-*.swp
-
-laptop/frontend/login.json
-
-
-
-@"
-# Datasets (too large)
+# Dataset directories (too large for repo)
 data/pipe_dataset_*/
 data/pipe_only/
 data/pipe_multi/
@@ -87,19 +159,48 @@ data/training/datasets/train/
 data/training/datasets/valid/
 data/training/datasets/test/
 
-# Model weights (use releases instead)
-*.pt
-!runs/detect/viper_pipe_v1/weights/best.pt
-
-# Python
-__pycache__/
-*.pyc
-venv/
-
-# Recordings
-recordings/
-
-# Cache
-*.cache
+# Numpy arrays
 *.npy
-"@ | Out-File -Encoding utf8 .gitignore
+*.npz
+
+# =========================
+# Recordings / Media
+# =========================
+recordings/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+
+# =========================
+# Firebase
+# =========================
+.firebase/
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+
+# =========================
+# Logs and databases
+# =========================
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# =========================
+# Specific project files
+# =========================
+laptop/frontend/login.json
+
+# =========================
+# Archives
+# =========================
+*.zip
+*.tar.gz
+*.rar
+*.7z
